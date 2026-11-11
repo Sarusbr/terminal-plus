@@ -163,8 +163,8 @@ onBeforeUnmount(() => { alive = false; stop(); });
 .searchbox { display: flex; align-items: center; gap: 6px; color: var(--muted); padding: 9px 10px; border-bottom: 1px solid var(--line); }
 .searchbox input { flex: 1; min-width: 0; border: 0; background: transparent; padding: 2px 0; }
 .sources { flex: 1; overflow: auto; padding: 4px 6px 16px; display: flex; flex-direction: column; }
-h4 { margin: 12px 6px 4px; font-size: 10.5px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-.src { text-align: left; padding: 3px 8px; border-radius: 4px; font: 12px var(--font-mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+h4 { flex: none; margin: 12px 6px 4px; font-size: 10.5px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.src { flex: none; text-align: left; padding: 3px 8px; border-radius: 4px; font: 12px var(--font-mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .src:hover { color: var(--fg); background: rgb(var(--fg-rgb) / 0.05); }
 .src.on { color: var(--fg); background: rgb(var(--fg-rgb) / 0.09); }
 .small { font-size: 11px; padding: 8px; }
