@@ -57,6 +57,9 @@ const persist = () => api.storeSave("vpn", vpn.profiles);
 export async function loadVpn() {
   const data = await api.storeLoad<VpnProfile[]>("vpn").catch(() => null);
   vpn.profiles = Array.isArray(data) ? data : [];
+  // Global connections left running by a previous session (crash / keep-on-exit).
+  const adopted = await invoke<VpnStatus[]>("vpn_adopt").catch(() => []);
+  if (adopted.length) toast(`Önceki oturumdan açık VPN: ${adopted.map((a) => a.name).join(", ")}`);
   for (const s of await invoke<VpnStatus[]>("vpn_list").catch(() => [])) vpn.status[s.id] = s;
   await refreshComponent();
 }

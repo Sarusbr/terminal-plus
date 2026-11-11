@@ -106,6 +106,7 @@ pub fn run() {
             vpn::vpn_list,
             vpn::vpn_log,
             vpn::vpn_socks_port,
+            vpn::vpn_adopt,
             vpn::vpn_secret_exists,
             vpn::vpn_secret_reveal,
             vpn::vpn_secret_set,

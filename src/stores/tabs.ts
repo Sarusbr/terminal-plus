@@ -34,6 +34,8 @@ export interface Tab {
   server: Server;
   connId: string;
   status: TabStatus;
+  /** What a connecting tab is waiting for (e.g. its VPN). */
+  phase?: string;
   ip?: string;
   error?: string;
   layout: PaneNode;
@@ -126,10 +128,13 @@ export async function connect(tab: Tab, creds: { password?: string; passphrase?:
     // Linked VPN: bring it up first; app mode → SSH dials through its SOCKS proxy.
     let proxy: string | undefined;
     if (s.vpnId) {
+      tab.phase = "VPN bağlanıyor…";
       try {
         proxy = await proxyFor(s.vpnId);
+        tab.phase = "";
       } catch (e) {
         if (tab.connId !== connId) return;
+        tab.phase = "";
         tab.status = "error";
         tab.error = `VPN: ${String((e as Error)?.message ?? e)}`;
         return;

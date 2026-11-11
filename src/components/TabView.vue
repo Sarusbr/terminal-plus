@@ -13,6 +13,7 @@ defineProps<{ tab: Tab }>();
       <div class="card">
         <template v-if="tab.status === 'connecting'">
           <div class="spinner" />
+          <div v-if="tab.phase" class="phase"><Icon name="vpn" :size="13" /> {{ tab.phase }}</div>
           <div class="muted">{{ tab.server.user }}@{{ tab.server.host }}:{{ tab.server.port }}</div>
         </template>
         <template v-else>
@@ -36,6 +37,7 @@ defineProps<{ tab: Tab }>();
 .overlay { position: absolute; inset: 0; display: grid; place-items: center; z-index: 10; }
 .overlay.dim { background: rgb(var(--bg-rgb) / 0.55); }
 .card { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 460px; text-align: center; color: var(--fg); }
+.phase { display: flex; align-items: center; gap: 6px; color: var(--accent); font-size: 12.5px; }
 .err { color: var(--danger); font-size: 12px; word-break: break-word; }
 .row { display: flex; gap: 8px; margin-top: 4px; }
 .spinner {

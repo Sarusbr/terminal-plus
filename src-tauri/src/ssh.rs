@@ -280,10 +280,20 @@ pub async fn ssh_connect<R: Runtime>(
 ) -> Result<ConnectResult, String> {
     let (tcp, ip) = match args.proxy.as_deref() {
         Some(proxy) => {
-            let t = tokio::time::timeout(Duration::from_secs(20), crate::socks::connect(proxy, &args.host, args.port))
-                .await
-                .map_err(|_| format!("TIMEOUT: {} (VPN)", args.host))??;
-            (t, "VPN".to_string())
+            // A freshly started tunnel can refuse the first dials for a moment: retry briefly.
+            let mut last = String::new();
+            let mut stream = None;
+            for attempt in 0..8 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                }
+                match tokio::time::timeout(Duration::from_secs(12), crate::socks::connect(proxy, &args.host, args.port)).await {
+                    Ok(Ok(t)) => { stream = Some(t); break; }
+                    Ok(Err(e)) => last = e,
+                    Err(_) => last = format!("TIMEOUT: {} (VPN)", args.host),
+                }
+            }
+            (stream.ok_or(last)?, "VPN".to_string())
         }
         None => {
             let addr = resolve(&args.host, args.port).await?;

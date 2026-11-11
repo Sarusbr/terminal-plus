@@ -51,9 +51,38 @@ pub fn launch<R: Runtime>(app: &AppHandle<R>, req: &ConnectReq, socks_port: Opti
             }
         }
     }
+    // The downloaded macOS bundle can't use Homebrew's CA store: give it the system roots.
+    #[cfg(target_os = "macos")]
+    if let Some(ca) = macos_ca_bundle(app, &program) {
+        args.push(format!("--cafile={}", ca.to_string_lossy()));
+    }
     args.push("--reconnect-timeout=60".into());
     args.push(req.server.clone());
     Ok(Launch { program, args })
+}
+
+/// macOS system root certificates as a PEM file (refreshed daily), for openconnect
+/// binaries that don't come from Homebrew.
+#[cfg(target_os = "macos")]
+fn macos_ca_bundle<R: Runtime>(app: &AppHandle<R>, program: &std::path::Path) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    if program.starts_with("/opt/homebrew") || program.starts_with("/usr/local") {
+        return None; // Homebrew's own build already knows its CA store.
+    }
+    let path = app.path().app_cache_dir().ok()?.join("system-roots.pem");
+    let fresh = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() < 86_400).unwrap_or(false);
+    if !fresh {
+        let out = std::process::Command::new("/usr/bin/security")
+            .args(["find-certificate", "-a", "-p", "/System/Library/Keychains/SystemRootCertificates.keychain"])
+            .output()
+            .ok()?;
+        if !out.status.success() || out.stdout.len() < 1000 {
+            return None;
+        }
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        std::fs::write(&path, &out.stdout).ok()?;
+    }
+    Some(path)
 }
 
 pub struct OcParser {

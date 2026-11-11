@@ -123,6 +123,19 @@ fn push_log(c: &Conn, line: &str) {
     }
 }
 
+/// Wait until something listens on 127.0.0.1:`port`.
+fn wait_port(port: u16, max: Duration) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let end = std::time::Instant::now() + max;
+    while std::time::Instant::now() < end {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    false
+}
+
 fn free_port() -> Result<u16, String> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     Ok(l.local_addr().map_err(|e| e.to_string())?.port())
@@ -143,6 +156,34 @@ fn apply<R: Runtime>(app: &AppHandle<R>, c: &Arc<Conn>, actions: Vec<Action>) {
                 let _ = app.emit("vpn-prompt", serde_json::json!({ "id": id, "kind": kind, "message": message, "options": options }));
             }
             Action::Connected { ip } => {
+                // App mode: openconnect reports "Configured" before ocproxy listens. Only call
+                // it connected once the local SOCKS port accepts connections, so whatever
+                // waits on us (SSH to a linked server) doesn't hit "connection refused".
+                let (port, first) = {
+                    let s = c.status.lock().unwrap();
+                    (s.socks_port, s.state != "connected" && s.state != "reconnecting")
+                };
+                if let (Some(port), true) = (port, first) {
+                    let (a2, c2) = (app.clone(), c.clone());
+                    std::thread::spawn(move || {
+                        let ready = wait_port(port, Duration::from_secs(15));
+                        if c2.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        if !ready {
+                            apply(&a2, &c2, vec![Action::Fail { kind: "other", message: "Yerel VPN proxy'si (ocproxy) başlamadı".into(), pin: None }]);
+                            return;
+                        }
+                        {
+                            let mut s = c2.status.lock().unwrap();
+                            s.state = "connected".into();
+                            s.ip = Some(ip);
+                            s.since = Some(now_ms());
+                        }
+                        emit_status(&a2, &c2);
+                    });
+                    continue;
+                }
                 {
                     let mut s = c.status.lock().unwrap();
                     let first = s.state != "connected" && s.state != "reconnecting";
@@ -378,6 +419,8 @@ fn start_root<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser:
 
     // Pick a tun unit so stats can be read from the interface counters.
     let iface = if cfg!(target_os = "macos") { Some(free_utun()) } else { Some(format!("tpvpn{}", &uuid::Uuid::new_v4().simple().to_string()[..4])) };
+    #[cfg(test)]
+    let iface = std::env::var("TP_TEST_IFACE").ok().or(iface);
     let sh = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let mut args: Vec<String> = l.args.iter().map(|a| sh(a)).collect();
     if let Some(i) = &iface {
@@ -394,6 +437,8 @@ fn start_root<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser:
         ctrl = sh(&ctrl.to_string_lossy()),
     );
     std::fs::write(&script, body).map_err(|e| e.to_string())?;
+    let (name, mode) = { let s = conn.status.lock().unwrap(); (s.name.clone(), s.mode.clone()) };
+    let _ = std::fs::write(dir.join("meta.json"), serde_json::json!({ "id": id, "name": name, "mode": mode, "iface": iface }).to_string());
     *conn.ctl.lock().unwrap() = Some(Ctl::Root { ctrl: ctrl.clone() });
 
     // FIFO writer: opening blocks until openconnect (root) opens it for reading.
@@ -422,75 +467,156 @@ fn start_root<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser:
             finish(&a, &id, &c);
             return;
         }
-        // Tail the log + watch the pid.
-        let mut pos = 0u64;
-        let mut seen_pid = None;
-        let mut pending = String::new();
-        let mut ticks = 0u32;
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            ticks += 1;
-            if let Ok(mut f) = std::fs::File::open(&log) {
-                use std::io::Seek;
-                let _ = f.seek(std::io::SeekFrom::Start(pos));
-                let mut chunk = String::new();
-                if let Ok(n) = f.read_to_string(&mut chunk) {
-                    pos += n as u64;
-                    pending.push_str(&chunk);
-                }
-            }
-            while let Some(i) = pending.find('\n') {
-                let line: String = pending.drain(..=i).collect();
-                let line = line.trim_end().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                push_log(&c, &line);
-                let acts = p.lock().unwrap().line(&line);
-                apply(&a, &c, acts);
-            }
-            if !pending.trim().is_empty() {
-                let acts = p.lock().unwrap().prompt(&pending);
-                if !acts.is_empty() {
-                    pending.clear();
-                    apply(&a, &c, acts);
-                }
-            }
-            if seen_pid.is_none() {
-                seen_pid = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<i32>().ok());
-            }
-            // Stats from interface counters every ~2 s.
-            if ticks % 8 == 0 {
-                if let (Some(i), true) = (&iface, c.status.lock().unwrap().state == "connected") {
-                    if let Some((rx, tx)) = iface_bytes(i) {
-                        let mut s = c.status.lock().unwrap();
-                        s.rx = rx;
-                        s.tx = tx;
-                    }
-                }
-            }
-            let alive = match seen_pid {
-                Some(pid) => pid_alive(pid),
-                // openconnect writes the pid file only after connecting; before that, the
-                // log is the signal. Give up if nothing happens for 2 minutes.
-                None => ticks < 480 && std::fs::metadata(&fifo).is_ok() && !c.stopping.load(std::sync::atomic::Ordering::Relaxed),
-            };
-            if !alive {
-                if seen_pid.is_none() && !c.stopping.load(std::sync::atomic::Ordering::Relaxed) && c.status.lock().unwrap().state == "connecting" {
-                    // No pid yet: maybe openconnect quit early — the log tells why.
-                }
-                break;
-            }
-            if c.stopping.load(std::sync::atomic::Ordering::Relaxed) && seen_pid.is_none() {
-                break;
-            }
-        }
-        let _ = std::fs::remove_file(&ctrl);
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = std::fs::remove_dir_all(&dir);
-        finish(&a, &id, &c);
+        root_watch(&a, &id, &c, &p, &RootFiles { dir, log, pid_file, ctrl, fifo }, iface.as_deref(), 0);
     });
     Ok(())
+}
+
+#[cfg(unix)]
+struct RootFiles {
+    dir: PathBuf,
+    log: PathBuf,
+    pid_file: PathBuf,
+    ctrl: PathBuf,
+    fifo: PathBuf,
+}
+
+/// Follow a root-run openconnect: tail its log through the parser, read interface
+/// counters, and finish when the process is gone. `start_at` skips already-seen log bytes
+/// (used when adopting a connection that outlived a previous app session).
+#[cfg(unix)]
+fn root_watch<R: Runtime>(a: &AppHandle<R>, id: &str, c: &Arc<Conn>, p: &Arc<Mutex<Box<dyn Parser>>>, f: &RootFiles, iface: Option<&str>, start_at: u64) {
+    let mut pos = start_at;
+    let mut seen_pid = None;
+    let mut pending = String::new();
+    let mut ticks = 0u32;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        ticks += 1;
+        if let Ok(mut fh) = std::fs::File::open(&f.log) {
+            use std::io::Seek;
+            let _ = fh.seek(std::io::SeekFrom::Start(pos));
+            let mut chunk = String::new();
+            if let Ok(n) = fh.read_to_string(&mut chunk) {
+                pos += n as u64;
+                pending.push_str(&chunk);
+            }
+        }
+        while let Some(i) = pending.find('\n') {
+            let line: String = pending.drain(..=i).collect();
+            let line = line.trim_end().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            push_log(c, &line);
+            let acts = p.lock().unwrap().line(&line);
+            apply(a, c, acts);
+        }
+        if !pending.trim().is_empty() {
+            let acts = p.lock().unwrap().prompt(&pending);
+            if !acts.is_empty() {
+                pending.clear();
+                apply(a, c, acts);
+            }
+        }
+        if seen_pid.is_none() {
+            seen_pid = std::fs::read_to_string(&f.pid_file).ok().and_then(|s| s.trim().parse::<i32>().ok());
+        }
+        // Stats from interface counters every ~2 s. (Read state into a local first:
+        // holding the status lock across the update would deadlock this thread.)
+        if ticks % 8 == 0 {
+            let connected = c.status.lock().unwrap().state == "connected";
+            if let (Some(i), true) = (iface, connected) {
+                if let Some((rx, tx)) = iface_bytes(i) {
+                    let mut s = c.status.lock().unwrap();
+                    s.rx = rx;
+                    s.tx = tx;
+                }
+            }
+        }
+        let stopping = c.stopping.load(std::sync::atomic::Ordering::Relaxed);
+        let alive = match seen_pid {
+            Some(pid) => pid_alive(pid),
+            // openconnect writes the pid file only after connecting; before that, the
+            // log is the signal. Give up if nothing happens for 2 minutes.
+            None => ticks < 480 && std::fs::metadata(&f.fifo).is_ok() && !stopping,
+        };
+        if !alive || (stopping && seen_pid.is_none()) {
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&f.ctrl);
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_dir_all(&f.dir);
+    finish(a, id, c);
+}
+
+/// Re-attach global connections that outlived a previous app session (crash, or "keep
+/// global VPN on exit"). Each root session leaves meta.json + pid in its temp dir.
+#[tauri::command]
+pub fn vpn_adopt<R: Runtime>(app: AppHandle<R>, state: State<'_, VpnState>) -> Vec<Status> {
+    #[cfg(unix)]
+    {
+        let mut out = vec![];
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return out };
+        for e in rd.flatten() {
+            let dir = e.path();
+            if !e.file_name().to_string_lossy().starts_with("tp-vpn-") {
+                continue;
+            }
+            let meta: Option<serde_json::Value> = std::fs::read_to_string(dir.join("meta.json")).ok().and_then(|s| serde_json::from_str(&s).ok());
+            let pid = std::fs::read_to_string(dir.join("pid")).ok().and_then(|s| s.trim().parse::<i32>().ok());
+            let alive = pid.map(pid_alive).unwrap_or(false);
+            if !alive {
+                // Leftover of a session whose process is gone (crash, killed app). Young dirs
+                // may belong to a connect in progress elsewhere — leave those alone.
+                let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() > 600).unwrap_or(false);
+                if old {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                continue;
+            }
+            let (Some(meta), Some(pid)) = (meta, pid) else { continue };
+            if !dir.join("run").exists() {
+                continue;
+            }
+            let _ = pid;
+            let id = meta["id"].as_str().unwrap_or_default().to_string();
+            if id.is_empty() || state.conns.lock().unwrap().contains_key(&id) {
+                continue;
+            }
+            let log = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+            let ip = log.lines().rev().find_map(|l| l.strip_prefix("Configured as ")).and_then(|r| r.split([',', ' ']).next()).map(String::from);
+            let files = RootFiles { log: dir.join("log"), pid_file: dir.join("pid"), ctrl: dir.join("run"), fifo: dir.join("in"), dir: dir.clone() };
+            let since = std::fs::metadata(&files.pid_file).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+            let conn = Arc::new(Conn {
+                status: Mutex::new(Status {
+                    id: id.clone(), name: meta["name"].as_str().unwrap_or("VPN").into(), state: "connected".into(),
+                    mode: "global".into(), ip, since, ..Default::default()
+                }),
+                input: Mutex::new(None),
+                log: Mutex::new({
+                    let lines: Vec<&str> = log.lines().collect();
+                    lines[lines.len().saturating_sub(100)..].iter().map(|l| l.to_string()).collect()
+                }),
+                ctl: Mutex::new(Some(Ctl::Root { ctrl: files.ctrl.clone() })),
+                stopping: Default::default(),
+            });
+            state.conns.lock().unwrap().insert(id.clone(), conn.clone());
+            out.push(conn.status.lock().unwrap().clone());
+            let req: ConnectReq = serde_json::from_value(serde_json::json!({ "id": id, "name": "", "protocol": "openconnect", "server": "", "mode": "global" })).unwrap();
+            let parser: Arc<Mutex<Box<dyn Parser>>> = Arc::new(Mutex::new(Box::new(openconnect::OcParser::new(&req))));
+            let iface = meta["iface"].as_str().map(String::from);
+            let (a, start) = (app.clone(), log.len() as u64);
+            std::thread::spawn(move || root_watch(&a, &id, &conn, &parser, &files, iface.as_deref(), start));
+        }
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, state);
+        vec![]
+    }
 }
 
 #[cfg(unix)]
@@ -743,10 +869,10 @@ fn iface_bytes(iface: &str) -> Option<(u64, u64)> {
     Some((p.get(n - 5)?.parse().ok()?, p.get(n - 2)?.parse().ok()?))
 }
 
+// The commands below are async so they never run on (and can never stall) the UI thread.
 #[tauri::command]
-pub fn vpn_input(state: State<'_, VpnState>, id: String, text: String) -> Result<(), String> {
-    let conns = state.conns.lock().unwrap();
-    let c = conns.get(&id).ok_or("NOT_CONNECTED")?;
+pub async fn vpn_input(state: State<'_, VpnState>, id: String, text: String) -> Result<(), String> {
+    let c = state.conns.lock().unwrap().get(&id).cloned().ok_or("NOT_CONNECTED")?;
     let mut w = c.input.lock().unwrap();
     let w = w.as_mut().ok_or("NOT_READY")?;
     w.write_all(format!("{text}\n").as_bytes()).map_err(|e| e.to_string())?;
@@ -754,28 +880,34 @@ pub fn vpn_input(state: State<'_, VpnState>, id: String, text: String) -> Result
 }
 
 #[tauri::command]
-pub fn vpn_disconnect(state: State<'_, VpnState>, id: String) {
-    if let Some(c) = state.conns.lock().unwrap().get(&id) {
-        stop(c);
+pub async fn vpn_disconnect(state: State<'_, VpnState>, id: String) -> Result<(), String> {
+    let c = state.conns.lock().unwrap().get(&id).cloned();
+    if let Some(c) = c {
+        stop(&c);
     }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn vpn_list(state: State<'_, VpnState>) -> Vec<Status> {
-    state.conns.lock().unwrap().values().map(|c| c.status.lock().unwrap().clone()).collect()
+pub async fn vpn_list(state: State<'_, VpnState>) -> Result<Vec<Status>, String> {
+    let conns: Vec<Arc<Conn>> = state.conns.lock().unwrap().values().cloned().collect();
+    Ok(conns.iter().map(|c| c.status.lock().unwrap().clone()).collect())
 }
 
 #[tauri::command]
-pub fn vpn_log(state: State<'_, VpnState>, id: String) -> Vec<String> {
-    state.conns.lock().unwrap().get(&id).map(|c| c.log.lock().unwrap().iter().cloned().collect()).unwrap_or_default()
+pub async fn vpn_log(state: State<'_, VpnState>, id: String) -> Result<Vec<String>, String> {
+    let c = state.conns.lock().unwrap().get(&id).cloned();
+    Ok(c.map(|c| c.log.lock().unwrap().iter().cloned().collect()).unwrap_or_default())
 }
 
 /// Is the SOCKS proxy of an app-mode connection up? Used before SSH dials through it.
 #[tauri::command]
-pub fn vpn_socks_port(state: State<'_, VpnState>, id: String) -> Option<u16> {
-    let conns = state.conns.lock().unwrap();
-    let s = conns.get(&id)?.status.lock().unwrap().clone();
-    (s.state == "connected" && s.mode == "app").then_some(s.socks_port).flatten()
+pub async fn vpn_socks_port(state: State<'_, VpnState>, id: String) -> Result<Option<u16>, String> {
+    let c = state.conns.lock().unwrap().get(&id).cloned();
+    Ok(c.and_then(|c| {
+        let s = c.status.lock().unwrap().clone();
+        (s.state == "connected" && s.mode == "app").then_some(s.socks_port).flatten()
+    }))
 }
 
 /// Disconnect everything (app exit). Global connections are left up when `keep_global`.
@@ -837,39 +969,82 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         while port.is_none() {
             let s = tokio::time::timeout_at(deadline, rx.recv()).await.expect("timeout").unwrap();
-            assert_ne!(s.state, "error", "vpn error: {:?} {:?}", s.error, vpn_log(h.state(), "t1".into()));
+            assert_ne!(s.state, "error", "vpn error: {:?} {:?}", s.error, vpn_log(h.state(), "t1".into()).await.unwrap());
             if s.state == "connected" {
                 assert!(s.ip.as_deref().unwrap_or("").starts_with("10."), "ip {:?}", s.ip);
                 port = s.socks_port;
             }
         }
         let port = port.unwrap();
-        assert_eq!(vpn_socks_port(h.state(), "t1".into()), Some(port));
+        assert_eq!(vpn_socks_port(h.state(), "t1".into()).await.unwrap(), Some(port));
         // Through the tunnel to a host only reachable via VPN.
         let (host, tport) = p[4].split_once(':').unwrap();
-        let mut s = None;
-        for _ in 0..20 {
-            match crate::socks::connect(&format!("127.0.0.1:{port}"), host, tport.parse().unwrap()).await {
-                Ok(x) => { s = Some(x); break; }
-                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
-            }
-        }
-        let mut s = s.expect("socks connect");
+        // "connected" must mean usable: the very first SOCKS dial has to work.
+        let mut s = crate::socks::connect(&format!("127.0.0.1:{port}"), host, tport.parse().unwrap()).await
+            .expect("SOCKS not usable right after 'connected'");
         let mut banner = [0u8; 8];
         tokio::io::AsyncReadExt::read_exact(&mut s, &mut banner).await.unwrap();
         assert_eq!(&banner, b"SSH-2.0-");
         // Stats arrive via SIGUSR1.
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let st = vpn_list(h.state()).into_iter().find(|x| x.id == "t1").unwrap();
+        let st = vpn_list(h.state()).await.unwrap().into_iter().find(|x| x.id == "t1").unwrap();
         assert!(st.rx > 0 && st.tx > 0, "stats {st:?}");
-        vpn_disconnect(h.state(), "t1".into());
+        vpn_disconnect(h.state(), "t1".into()).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let s = tokio::time::timeout_at(deadline, rx.recv()).await.expect("no disconnect").unwrap();
             if s.state == "disconnected" { break; }
             assert_ne!(s.state, "error", "{:?}", s.error);
         }
-        assert!(vpn_list(h.state()).is_empty());
+        assert!(vpn_list(h.state()).await.unwrap().is_empty());
+    }
+
+    /// Regression: stats polling while connected used to deadlock the status mutex and
+    /// freeze the UI. A fake openconnect "connects"; counters come from lo0.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_connected_stats_do_not_deadlock() {
+        std::env::set_var("TP_ELEVATE", "direct");
+        std::env::set_var("TP_TEST_IFACE", "lo0");
+        let dir = std::env::temp_dir().join(format!("tp_fakeoc_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("openconnect");
+        std::fs::write(&fake, "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --pid-file=*) echo $$ > \"${a#--pid-file=}\";; esac; done\n\
+echo 'Configured as 10.9.9.9, with SSL connected'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app = tauri::test::mock_app();
+        app.manage(VpnState::default());
+        let h = app.handle().clone();
+        let req: ConnectReq = serde_json::from_value(serde_json::json!({
+            "id": "dl", "name": "fake", "protocol": "openconnect", "server": "x", "mode": "global"
+        })).unwrap();
+        let conn = Arc::new(Conn {
+            status: Mutex::new(Status { id: "dl".into(), name: "fake".into(), state: "connecting".into(), mode: "global".into(), ..Default::default() }),
+            input: Mutex::new(None), log: Mutex::new(VecDeque::new()), ctl: Mutex::new(None), stopping: Default::default(),
+        });
+        h.state::<VpnState>().conns.lock().unwrap().insert("dl".into(), conn.clone());
+        let parser: Arc<Mutex<Box<dyn Parser>>> = Arc::new(Mutex::new(Box::new(openconnect::OcParser::new(&req))));
+        start_root(&h, "dl", conn, parser, Launch { program: fake, args: vec![] }).unwrap();
+
+        // Stay connected across several stats ticks; every status query must answer fast.
+        let mut connected_polls = 0;
+        for _ in 0..16 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let list = tokio::time::timeout(Duration::from_secs(2), vpn_list(h.state())).await.expect("vpn_list blocked (deadlock)").unwrap();
+            if list.iter().any(|s| s.state == "connected") { connected_polls += 1; }
+        }
+        assert!(connected_polls >= 8, "never stayed connected");
+        let s = vpn_list(h.state()).await.unwrap().into_iter().next().unwrap();
+        assert!(s.rx > 0 && s.tx > 0, "no interface stats: {s:?}");
+        vpn_disconnect(h.state(), "dl".into()).await.unwrap();
+        for _ in 0..40 {
+            if vpn_list(h.state()).await.unwrap().is_empty() { break; }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(vpn_list(h.state()).await.unwrap().is_empty(), "not cleaned up after disconnect");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Global-mode plumbing without root: FIFO password, log tail, failure + cleanup.
@@ -897,18 +1072,21 @@ mod tests {
             assert!(v.get("kind").is_none(), "unexpected prompt (password not delivered via FIFO?): {v}");
             if v["state"] == "error" || v["state"] == "disconnected" { break v; }
         };
-        let log = vpn_log(h.state(), "g1".into());
+        let log = vpn_log(h.state(), "g1".into()).await.unwrap();
         let joined = last.to_string();
         // Auth went through the FIFO; then the tun device can't be opened without root.
         assert_ne!(last["errorKind"], "auth", "{joined}");
         assert!(last["error"].as_str().unwrap_or("").to_lowercase().contains("tun") || joined.contains("tun"), "{joined} {log:?}");
         for _ in 0..40 {
-            if vpn_list(h.state()).is_empty() { break; }
+            if vpn_list(h.state()).await.unwrap().is_empty() { break; }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        assert!(vpn_list(h.state()).is_empty(), "connection not cleaned up");
+        assert!(vpn_list(h.state()).await.unwrap().is_empty(), "connection not cleaned up");
+        // Only this test's session dir (a real VPN may be running on the dev machine).
         let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("tp-vpn-")).collect();
+            .filter(|e| e.file_name().to_string_lossy().starts_with("tp-vpn-"))
+            .filter(|e| std::fs::read_to_string(e.path().join("meta.json")).map(|m| m.contains("\"g1\"")).unwrap_or(false))
+            .collect();
         assert!(leftovers.is_empty(), "temp dirs left: {leftovers:?}");
     }
 
@@ -949,6 +1127,6 @@ mod tests {
             if v["kind"] == "password" { break; }
             assert_ne!(v["state"], "connected");
         }
-        vpn_disconnect(h.state(), "c2".into());
+        vpn_disconnect(h.state(), "c2".into()).await.unwrap();
     }
 }
