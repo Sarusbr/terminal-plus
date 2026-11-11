@@ -85,7 +85,11 @@ async function openShell() {
   await nextTick();
   try {
     const onData = (d: Uint8Array) => { if (!runner.feed(d)) term.write(d); };
-    if (props.tab.kind === "local") runner.setMode(await api.localPtyOpen(id, term.cols, term.rows, onData));
+    if (props.tab.kind === "local") {
+      const r = await api.localPtyOpen(id, term.cols, term.rows, props.tab.shell, onData);
+      props.tab.shellKind = r.kind;
+      runner.setMode(r.mode);
+    }
     else {
       runner.setMode(null); // remote: detected + set up on first panel use
       await api.ptyOpen(props.tab.connId, id, term.cols, term.rows, onData);
@@ -110,6 +114,7 @@ function currentLine(): string {
 /** `nano <file>` at the prompt → open the built-in editor instead. */
 function interceptNano(): boolean {
   if (term.buffer.active.type === "alternate") return false;
+  if (props.tab.shellKind && props.tab.shellKind !== "posix") return false; // cmd / PowerShell
   const m = /(?:^|[\s$#%>❯»\]])(sudo\s+(?:-\S+\s+)*)?nano((?:\s+\S+)+)\s*$/.exec(currentLine());
   if (!m) return false;
   const args = m[2].trim().split(/\s+/).filter((a) => !a.startsWith("-") && !a.startsWith("+"));
@@ -186,6 +191,16 @@ onMounted(() => {
   term.onData(onInput);
   term.onBinary(onInput);
   term.onResize(({ cols, rows }) => { if (ptyId) api.ptyResize(ptyId, cols, rows).catch(() => {}); });
+  // Shells report their cwd: OSC 9;9;<path> (Windows Terminal style) or OSC 7;file://host/path.
+  const setCwd = (path: string) => { const p = pane(); if (p && path) p.cwd = path; };
+  term.parser.registerOscHandler(9, (data) => {
+    if (data.startsWith("9;")) setCwd(data.slice(2).replace(/^"(.*)"$/, "$1"));
+    return data.startsWith("9;");
+  });
+  term.parser.registerOscHandler(7, (data) => {
+    try { setCwd(decodeURIComponent(new URL(data).pathname)); } catch { /* ignore */ }
+    return false;
+  });
   term.buffer.onBufferChange((b) => {
     const p = pane();
     if (p) p.alt = b.type === "alternate";

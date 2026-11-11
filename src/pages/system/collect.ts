@@ -103,3 +103,55 @@ export async function collect(shell: Shell): Promise<SysInfo> {
   }
   return info;
 }
+
+// ── Windows (local tabs): one PowerShell/CIM call, JSON out ─────────────────
+const WIN_SCRIPT = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$os = Get-CimInstance Win32_OperatingSystem
+$p = @(Get-CimInstance Win32_Processor)
+$pf = @(Get-CimInstance Win32_PageFileUsage)
+$disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+  @{ mount = $_.DeviceID; fs = (($_.VolumeName + ' ' + $_.FileSystem).Trim()); size = [double]$_.Size; free = [double]$_.FreeSpace } })
+@{
+  host = $env:COMPUTERNAME; os = $os.Caption; ver = $os.Version; arch = $os.OSArchitecture
+  uptime = [double]((Get-Date) - $os.LastBootUpTime).TotalSeconds
+  memTotal = [double]$os.TotalVisibleMemorySize * 1024; memFree = [double]$os.FreePhysicalMemory * 1024
+  cpu = ($p | Measure-Object -Property LoadPercentage -Average).Average
+  cores = ($p | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+  swapTotal = [double](($pf | Measure-Object -Property AllocatedBaseSize -Sum).Sum) * 1MB
+  swapUsed = [double](($pf | Measure-Object -Property CurrentUsage -Sum).Sum) * 1MB
+  disks = $disks
+} | ConvertTo-Json -Compress -Depth 4`;
+
+interface WinRaw {
+  host: string; os: string; ver: string; arch: string; uptime: number; memTotal: number; memFree: number;
+  cpu: number | null; cores: number; swapTotal: number; swapUsed: number;
+  disks: { mount: string; fs: string; size: number; free: number }[];
+}
+
+export function parseWindows(out: string): SysInfo {
+  const j = JSON.parse(out.trim()) as WinRaw;
+  const disks = (Array.isArray(j.disks) ? j.disks : j.disks ? [j.disks] : []).filter((d) => d.size > 0);
+  return {
+    host: j.host, os: j.os, uname: `Windows ${j.ver} ${j.arch ?? ""}`.trim(), uptime: j.uptime || 0, load: [],
+    cores: j.cores || 1, memTotal: j.memTotal || 0, memUsed: Math.max(0, (j.memTotal || 0) - (j.memFree || 0)),
+    swapTotal: j.swapTotal || 0, swapUsed: j.swapUsed || 0, cpu: j.cpu ?? null,
+    disks: disks.map((d) => ({
+      fs: d.fs || d.mount, mount: d.mount, size: d.size, used: d.size - d.free,
+      pct: Math.round(((d.size - d.free) / d.size) * 100),
+    })),
+  };
+}
+
+export async function collectWindows(): Promise<SysInfo> {
+  const { winExec } = await import("../../lib/winlocal");
+  // -EncodedCommand (UTF-16LE base64) avoids every command-line quoting/newline pitfall.
+  const bytes = new Uint8Array(WIN_SCRIPT.length * 2);
+  for (let i = 0; i < WIN_SCRIPT.length; i++) {
+    const c = WIN_SCRIPT.charCodeAt(i);
+    bytes[i * 2] = c & 0xff;
+    bytes[i * 2 + 1] = c >> 8;
+  }
+  const enc = btoa(String.fromCharCode(...bytes));
+  return parseWindows(await winExec("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc], undefined, 30000));
+}

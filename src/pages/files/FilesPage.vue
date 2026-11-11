@@ -11,6 +11,8 @@ import { listCwd, fmtSize, fmtMode, fmtDate } from "./listing";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { downloadDir } from "@tauri-apps/api/path";
 import { filesCwd, startTransfer, transfers } from "../../stores/transfers";
+import { api } from "../../lib/api";
+import { isWinLocal, cwdOf, winCd, winCrumbs, winHome, winJoin, winParent } from "../../lib/winlocal";
 
 const tab = ref<Tab | undefined>(activeTab.value);
 const cwd = ref("");
@@ -23,6 +25,9 @@ const clip = ref<{ op: "cp" | "mv"; paths: string[]; tabId: string } | null>(nul
 
 watch(showHidden, (v) => { try { localStorage.setItem("tp.files.hidden", v ? "1" : "0"); } catch { /* ignore */ } });
 
+/** Windows local tab: fs via Rust, cwd from the prompt, no shell commands. */
+const win = computed(() => isWinLocal(tab.value));
+
 const isDir = (e: FsEntry) => e.kind === "d" || (e.kind === "l" && !!e.linkDir);
 const rows = computed(() =>
   entries.value
@@ -30,10 +35,13 @@ const rows = computed(() =>
     .sort((a, b) => Number(isDir(b)) - Number(isDir(a)) || a.name.localeCompare(b.name, undefined, { numeric: true })),
 );
 const crumbs = computed(() => {
+  if (win.value) return winCrumbs(cwd.value);
   const parts = cwd.value.split("/").filter(Boolean);
   return [{ name: "/", path: "/" }, ...parts.map((p, i) => ({ name: p, path: "/" + parts.slice(0, i + 1).join("/") }))];
 });
-const abs = (name: string) => (cwd.value === "/" ? "/" : cwd.value + "/") + name;
+const abs = (name: string) => (win.value ? winJoin(cwd.value, name) : (cwd.value === "/" ? "/" : cwd.value + "/") + name);
+const isRoot = computed(() => (win.value ? winParent(cwd.value) === cwd.value : cwd.value === "/"));
+const sep = computed(() => (win.value ? "\\" : "/"));
 const selPaths = () => [...selected.value].map(abs);
 
 async function load() {
@@ -42,7 +50,12 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    const r = await listCwd(sh(t));
+    const r = win.value
+      ? await (async () => {
+          const dir = cwdOf(t) || (await winHome());
+          return { cwd: dir, entries: await api.localListDir(dir) };
+        })()
+      : await listCwd(sh(t));
     cwd.value = r.cwd;
     filesCwd[t.id] = r.cwd;
     entries.value = r.entries;
@@ -58,7 +71,8 @@ async function load() {
 async function cd(path: string) {
   if (!tab.value) return;
   try {
-    await sh(tab.value).ok(path === "~" ? "cd" : `cd -- ${q(path)}`);
+    if (win.value) await winCd(tab.value, path === ".." ? winParent(cwd.value) : path);
+    else await sh(tab.value).ok(path === "~" ? "cd" : `cd -- ${q(path)}`);
     selected.value = new Set();
     await load();
   } catch (e) {
@@ -101,18 +115,29 @@ async function act(build: (sudo: string) => string, okMsg?: string) {
   await load();
 }
 
+/** Windows: Rust fs operation, then reload. */
+async function fsAct(fn: () => Promise<void>) {
+  try { await fn(); } catch (e) { toast(String((e as Error)?.message ?? e)); }
+  await load();
+}
+
 async function newFile() {
   const r = await prompt({ title: "Yeni dosya", placeholder: "dosya.txt" });
-  if (r?.value.trim()) await act((s) => `${s}touch -- ${q(abs(r.value.trim()))}`);
+  if (!r?.value.trim()) return;
+  if (win.value) return fsAct(() => api.fsOp("touch", [abs(r.value.trim())]));
+  await act((s) => `${s}touch -- ${q(abs(r.value.trim()))}`);
 }
 async function newDir() {
   const r = await prompt({ title: "Yeni klasör", placeholder: "klasör" });
-  if (r?.value.trim()) await act((s) => `${s}mkdir -p -- ${q(abs(r.value.trim()))}`);
+  if (!r?.value.trim()) return;
+  if (win.value) return fsAct(() => api.fsOp("mkdir", [abs(r.value.trim())]));
+  await act((s) => `${s}mkdir -p -- ${q(abs(r.value.trim()))}`);
 }
 async function rename() {
   const [name] = selected.value;
   const r = await prompt({ title: "Yeniden adlandır", value: name });
   const to = r?.value.trim();
+  if (to && to !== name && win.value) return fsAct(() => api.fsOp("rename", [abs(name)], /^[A-Za-z]:[\\/]/.test(to) ? to : abs(to)));
   if (to && to !== name) await act((s) => `${s}mv -n -- ${q(abs(name))} ${q(to.startsWith("/") ? to : abs(to))}`);
 }
 async function remove() {
@@ -121,6 +146,7 @@ async function remove() {
     title: paths.length === 1 ? `${[...selected.value][0]} silinsin mi?` : `${paths.length} öğe silinsin mi?`,
     message: "Bu işlem geri alınamaz.", danger: true, okText: "Sil",
   });
+  if (ok && win.value) return fsAct(() => api.fsOp("remove", paths));
   if (ok) await act((s) => `${s}rm -rf -- ${paths.map(q).join(" ")}`);
 }
 async function chmod() {
@@ -139,6 +165,11 @@ function copySel(op: "cp" | "mv") {
 async function pasteHere() {
   const c = clip.value;
   if (!c || c.tabId !== tab.value?.id) return;
+  if (win.value) {
+    await fsAct(() => api.fsOp(c.op === "cp" ? "copy" : "move", c.paths, cwd.value));
+    if (c.op === "mv") clip.value = null;
+    return;
+  }
   const srcs = c.paths.map(q).join(" ");
   await act((s) => (c.op === "cp" ? `${s}cp -R -- ${srcs} ${q(cwd.value)}` : `${s}mv -- ${srcs} ${q(cwd.value)}`));
   if (c.op === "mv") clip.value = null;
@@ -162,18 +193,20 @@ watch(() => activeTab.value?.id, () => {
   load();
 });
 watch(() => transfers.version, load);
+// Windows: follow `cd` typed in the terminal while the page is open.
+watch(() => (win.value && tab.value ? cwdOf(tab.value) : undefined), (c) => { if (c && c !== cwd.value) load(); });
 onMounted(load);
 </script>
 
 <template>
   <div class="page" @keydown.delete.self="selected.size && remove()">
     <div class="toolbar">
-      <button class="ib" data-tip="Üst dizin" data-tip-pos="bottom" :disabled="cwd === '/'" @click="cd('..')"><Icon name="arrowUp" /></button>
+      <button class="ib" data-tip="Üst dizin" data-tip-pos="bottom" :disabled="isRoot" @click="cd('..')"><Icon name="arrowUp" /></button>
       <button class="ib" data-tip="Ev dizini" data-tip-pos="bottom" @click="cd('~')"><Icon name="home" /></button>
       <nav class="crumbs">
         <template v-for="(c, i) in crumbs" :key="c.path">
           <button class="crumb" :class="{ last: i === crumbs.length - 1 }" @click="cd(c.path)">{{ c.name }}</button>
-          <span v-if="i > 0 && i < crumbs.length - 1" class="sep">/</span>
+          <span v-if="i > 0 && i < crumbs.length - 1" class="sep">{{ sep }}</span>
         </template>
       </nav>
       <div class="tools">
@@ -182,7 +215,7 @@ onMounted(load);
           <button class="ib" data-tip="Yeniden adlandır" data-tip-pos="bottom" :disabled="selected.size !== 1" @click="rename"><Icon name="edit" /></button>
           <button class="ib" data-tip="Kopyala" data-tip-pos="bottom" @click="copySel('cp')"><Icon name="copy" /></button>
           <button class="ib" data-tip="Kes (taşı)" data-tip-pos="bottom" @click="copySel('mv')"><Icon name="cut" /></button>
-          <button class="ib" data-tip="İzinler" data-tip-pos="bottom" @click="chmod"><Icon name="chmod" /></button>
+          <button v-if="!win" class="ib" data-tip="İzinler" data-tip-pos="bottom" @click="chmod"><Icon name="chmod" /></button>
           <button class="ib" data-tip="Yolu kopyala" data-tip-pos="bottom" @click="copyPath"><Icon name="link" /></button>
           <button class="ib" data-tip="İndir" data-tip-pos="bottom" @click="download"><Icon name="pull" /></button>
           <button class="ib danger" data-tip="Sil" data-tip-pos="bottom" @click="remove"><Icon name="trash" /></button>

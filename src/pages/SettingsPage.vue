@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { settings, platform, resetSettings, currentTheme } from "../stores/settings";
+import { localShells, loadLocalShells } from "../stores/tabs";
+if (!localShells.list.length) loadLocalShells();
 import { themes } from "../lib/themes";
 import Icon from "../components/Icon.vue";
 
@@ -77,6 +79,11 @@ const shortcuts: [string, string][] = [
 
     <section>
       <h4>Terminal</h4>
+      <label v-if="localShells.list.length > 1" class="row"><span>Varsayılan shell</span>
+        <select v-model="settings.localShell">
+          <option v-for="(s, i) in localShells.list" :key="s.id" :value="i === 0 ? '' : s.id">{{ s.name }}</option>
+        </select>
+      </label>
       <label class="row"><span>İmleç</span>
         <select v-model="settings.cursorStyle">
           <option value="block">blok</option><option value="bar">çizgi</option><option value="underline">alt çizgi</option>

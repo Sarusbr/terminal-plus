@@ -3,7 +3,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { activeTab, type Tab } from "../../stores/tabs";
 import { confirm, prompt, toast, ui } from "../../stores/ui";
 import Icon from "../../components/Icon.vue";
-import { sh } from "../../lib/shell";
 import { docker, DockerError, type Container, type Image, type Volume, type Network, type Compose, type Stats } from "./docker";
 
 type Section = "containers" | "images" | "volumes" | "networks" | "compose";
@@ -58,12 +57,12 @@ async function load() {
   error.value = null;
   try {
     const x = d();
-    if (section.value === "containers") containers.value = x.jsonLines<Container>(await x.run("ps -a --format '{{json .}}'"));
-    if (section.value === "images") images.value = x.jsonLines<Image>(await x.run("images --format '{{json .}}'"));
-    if (section.value === "volumes") volumes.value = x.jsonLines<Volume>(await x.run("volume ls --format '{{json .}}'"));
-    if (section.value === "networks") networks.value = x.jsonLines<Network>(await x.run("network ls --format '{{json .}}'"));
+    if (section.value === "containers") containers.value = x.jsonLines<Container>(await x.run(["ps", "-a", "--format", "{{json .}}"]));
+    if (section.value === "images") images.value = x.jsonLines<Image>(await x.run(["images", "--format", "{{json .}}"]));
+    if (section.value === "volumes") volumes.value = x.jsonLines<Volume>(await x.run(["volume", "ls", "--format", "{{json .}}"]));
+    if (section.value === "networks") networks.value = x.jsonLines<Network>(await x.run(["network", "ls", "--format", "{{json .}}"]));
     if (section.value === "compose") {
-      const out = (await x.run("compose ls -a --format json")).trim();
+      const out = (await x.run(["compose", "ls", "-a", "--format", "json"])).trim();
       composes.value = out.startsWith("[") ? JSON.parse(out) : [];
     }
   } catch (e) {
@@ -73,7 +72,7 @@ async function load() {
   }
 }
 
-async function doAct(key: string, args: string, msg?: string) {
+async function doAct(key: string, args: string[], msg?: string) {
   busy.value = new Set(busy.value).add(key);
   try {
     await d().run(args, 120000);
@@ -86,10 +85,10 @@ async function doAct(key: string, args: string, msg?: string) {
   await load();
 }
 
-const cAct = (c: Container, verb: string) => doAct(c.ID, `${verb} ${d().q(c.ID)}`);
+const cAct = (c: Container, verb: string) => doAct(c.ID, [verb, c.ID]);
 async function cRemove(c: Container) {
   if (await confirm({ title: `${c.Names} silinsin mi?`, message: "Container zorla kaldırılır (rm -f).", danger: true, okText: "Sil" }))
-    doAct(c.ID, `rm -f ${d().q(c.ID)}`);
+    doAct(c.ID, ["rm", "-f", c.ID]);
 }
 async function cKill(c: Container) {
   if (await confirm({ title: `${c.Names} kill?`, message: "SIGKILL gönderilir.", danger: true, okText: "Kill" }))
@@ -111,7 +110,7 @@ async function openDetail(kind: Detail["kind"], c: Container) {
     await fetchLogs(true);
   } else if (kind === "inspect") {
     inspectRaw.value = "";
-    try { inspectRaw.value = await d().run(`inspect ${d().q(c.ID)}`); } catch (e) { inspectRaw.value = String(e); }
+    try { inspectRaw.value = await d().run(["inspect", c.ID]); } catch (e) { inspectRaw.value = String(e); }
   } else {
     await fetchStats();
   }
@@ -121,7 +120,7 @@ async function fetchLogs(initial = false) {
   const det = detail.value;
   if (!det || det.kind !== "logs") return;
   const now = Math.floor(Date.now() / 1000);
-  const args = initial ? `logs --tail ${logLines.value} ${d().q(det.c.ID)}` : `logs --since ${logSince} ${d().q(det.c.ID)}`;
+  const args = initial ? ["logs", "--tail", String(logLines.value), det.c.ID] : ["logs", "--since", String(logSince), det.c.ID];
   try {
     const out = await d().run(args);
     logSince = now;
@@ -142,7 +141,7 @@ async function fetchStats() {
   if (!det || det.kind !== "stats") return;
   try {
     const x = d();
-    stats.value = x.jsonLines<Stats>(await x.run(`stats --no-stream --format '{{json .}}' ${x.q(det.c.ID)}`))[0] ?? null;
+    stats.value = x.jsonLines<Stats>(await x.run(["stats", "--no-stream", "--format", "{{json .}}", det.c.ID]))[0] ?? null;
   } catch { stats.value = null; }
   if (detail.value === det) pollTimer = window.setTimeout(fetchStats, 3000);
 }
@@ -173,28 +172,28 @@ watch(logFollow, (f) => { stopPoll(); if (f) fetchLogs(); });
 // ── images / volumes / networks / compose ─────────────────
 async function pullImage() {
   const r = await prompt({ title: "Image pull", placeholder: "nginx:latest" });
-  if (r?.value.trim()) doAct("pull", `pull ${d().q(r.value.trim())}`, "Pull tamamlandı");
+  if (r?.value.trim()) doAct("pull", ["pull", r.value.trim()], "Pull tamamlandı");
 }
 async function rmImage(i: Image) {
-  if (await confirm({ title: `${i.Repository}:${i.Tag} silinsin mi?`, danger: true, okText: "Sil" })) doAct(i.ID, `rmi ${d().q(i.ID)}`);
+  if (await confirm({ title: `${i.Repository}:${i.Tag} silinsin mi?`, danger: true, okText: "Sil" })) doAct(i.ID, ["rmi", i.ID]);
 }
 async function rmVolume(v: Volume) {
-  if (await confirm({ title: `${v.Name} silinsin mi?`, message: "Volume içindeki veriler silinir.", danger: true, okText: "Sil" })) doAct(v.Name, `volume rm ${d().q(v.Name)}`);
+  if (await confirm({ title: `${v.Name} silinsin mi?`, message: "Volume içindeki veriler silinir.", danger: true, okText: "Sil" })) doAct(v.Name, ["volume", "rm", v.Name]);
 }
 async function rmNetwork(n: Network) {
-  if (await confirm({ title: `${n.Name} silinsin mi?`, danger: true, okText: "Sil" })) doAct(n.ID, `network rm ${d().q(n.ID)}`);
+  if (await confirm({ title: `${n.Name} silinsin mi?`, danger: true, okText: "Sil" })) doAct(n.ID, ["network", "rm", n.ID]);
 }
-function composeArgs(c: Compose) {
-  const files = (c.ConfigFiles || "").split(",").filter(Boolean).map((f) => `-f ${d().q(f)}`).join(" ");
-  return `compose -p ${d().q(c.Name)} ${files}`;
+function composeArgs(c: Compose): string[] {
+  const files = (c.ConfigFiles || "").split(",").filter(Boolean).flatMap((f) => ["-f", f]);
+  return ["compose", "-p", c.Name, ...files];
 }
 async function composeDo(c: Compose, verb: "up -d" | "down" | "restart") {
   if (verb === "down" && !(await confirm({ title: `${c.Name} down?`, message: "Servisler durdurulup kaldırılır.", danger: true, okText: "Down" }))) return;
-  doAct(c.Name, `${composeArgs(c)} ${verb}`);
+  doAct(c.Name, [...composeArgs(c), ...verb.split(" ")]);
 }
 function composeLogs(c: Compose) {
   // Live, scrollable output belongs in the terminal.
-  sh(tab.value!).type(`docker ${composeArgs(c)} logs -f --tail 200`);
+  d().type([...composeArgs(c), "logs", "-f", "--tail", "200"]);
   ui.page = "terminal";
 }
 async function prune(what: "container" | "image" | "volume" | "network" | "system") {
@@ -202,7 +201,7 @@ async function prune(what: "container" | "image" | "volume" | "network" | "syste
     title: `${what} prune`, danger: true, okText: "Prune",
     message: { container: "Durmuş tüm container'lar silinir.", image: "Kullanılmayan (dangling) image'lar silinir.", volume: "Kullanılmayan volume'ler silinir — veriler kaybolur.", network: "Kullanılmayan network'ler silinir.", system: "Durmuş container'lar, kullanılmayan network'ler, dangling image'lar ve build cache silinir." }[what],
   });
-  if (ok) doAct("prune", `${what} prune -f`, "Temizlendi");
+  if (ok) doAct("prune", [what, "prune", "-f"], "Temizlendi");
 }
 
 function portsShort(p: string) {

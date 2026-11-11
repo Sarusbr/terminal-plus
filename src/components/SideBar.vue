@@ -14,7 +14,7 @@ function blocked(p: PageDef): string {
   if (!p.needsShell) return "";
   const t = activeTab.value;
   if (!t || t.status !== "connected") return "Bağlı sekme yok";
-  if (t.kind === "local" && platform.os === "windows") return "Windows yerel shell'de desteklenmiyor";
+  if (t.kind === "local" && platform.os === "windows" && !p.windows) return "Windows yerel terminalde desteklenmiyor";
   if (t.panes[t.activePane]?.alt) return "Terminalde etkileşimli program çalışıyor";
   if (t.panes[t.activePane]?.busy) return "Terminalde bir program çalışıyor";
   return "";

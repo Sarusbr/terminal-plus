@@ -185,3 +185,97 @@ pub fn local_list_dir(path: String) -> Result<Vec<Entry>, String> {
     }
     Ok(out)
 }
+
+fn copy_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            copy_recursive(&e.path(), &to.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+fn io_msg(e: std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => "Yetki yok".into(),
+        std::io::ErrorKind::AlreadyExists => "Zaten var".into(),
+        std::io::ErrorKind::NotFound => "Bulunamadı".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// Local file operations for the Files page where shell commands aren't used (Windows).
+/// op: mkdir | touch | rename (paths[0] → dest) | remove | copy / move (paths → dest dir)
+#[tauri::command]
+pub fn fs_op(op: String, paths: Vec<String>, dest: Option<String>) -> Result<(), String> {
+    use std::path::Path;
+    let first = paths.first().ok_or("no path")?;
+    match op.as_str() {
+        "mkdir" => std::fs::create_dir_all(first).map_err(io_msg),
+        "touch" => std::fs::OpenOptions::new().create(true).append(true).open(first).map(|_| ()).map_err(io_msg),
+        "rename" => {
+            let to = dest.ok_or("no dest")?;
+            if Path::new(&to).exists() {
+                return Err("Zaten var".into());
+            }
+            std::fs::rename(first, to).map_err(io_msg)
+        }
+        "remove" => {
+            for p in &paths {
+                let m = std::fs::symlink_metadata(p).map_err(io_msg)?;
+                if m.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }.map_err(io_msg)?;
+            }
+            Ok(())
+        }
+        "copy" | "move" => {
+            let dir = std::path::PathBuf::from(dest.ok_or("no dest")?);
+            for p in &paths {
+                let src = Path::new(p);
+                let name = src.file_name().ok_or("bad path")?;
+                let to = dir.join(name);
+                if to == src {
+                    continue;
+                }
+                if op == "move" && std::fs::rename(src, &to).is_ok() {
+                    continue;
+                }
+                copy_recursive(src, &to).map_err(io_msg)?;
+                if op == "move" {
+                    let m = std::fs::symlink_metadata(src).map_err(io_msg)?;
+                    if m.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) }.map_err(io_msg)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("unknown op {op}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_ops_roundtrip() {
+        let base = std::env::temp_dir().join(format!("tp_fsop_{}", uuid::Uuid::new_v4().simple()));
+        let b = |p: &str| base.join(p).to_string_lossy().into_owned();
+        fs_op("mkdir".into(), vec![b("a/sub")], None).unwrap();
+        fs_op("touch".into(), vec![b("a/sub/f.txt")], None).unwrap();
+        std::fs::write(b("a/sub/f.txt"), "x").unwrap();
+        fs_op("mkdir".into(), vec![b("dst")], None).unwrap();
+        fs_op("copy".into(), vec![b("a")], Some(b("dst"))).unwrap();
+        assert_eq!(std::fs::read_to_string(b("dst/a/sub/f.txt")).unwrap(), "x");
+        fs_op("rename".into(), vec![b("dst/a")], Some(b("dst/b"))).unwrap();
+        assert!(fs_op("rename".into(), vec![b("a")], Some(b("dst"))).is_err());
+        fs_op("move".into(), vec![b("dst/b")], Some(b(""))).unwrap();
+        assert!(base.join("b/sub/f.txt").is_file());
+        fs_op("remove".into(), vec![b("a"), b("b")], None).unwrap();
+        assert!(!base.join("a").exists() && !base.join("b").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+}

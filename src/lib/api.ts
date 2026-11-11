@@ -14,6 +14,8 @@ export interface ConnectArgs {
   saveSecret?: boolean;
 }
 
+export type ShellKind = "cmd" | "powershell" | "posix";
+
 export interface FsEntry {
   name: string;
   kind: "d" | "f" | "l" | "o";
@@ -47,11 +49,17 @@ export const api = {
     return invoke<void>("pty_open", { connId, ptyId, cols, rows, onData: ch });
   },
   localInfo: () => invoke<{ shell: string; user: string }>("local_info"),
-  localPtyOpen: (ptyId: string, cols: number, rows: number, onData: (d: Uint8Array) => void) => {
+  localShells: () => invoke<{ id: string; name: string }[]>("local_shells"),
+  localPtyOpen: (ptyId: string, cols: number, rows: number, shell: string | undefined, onData: (d: Uint8Array) => void) => {
     const ch = new Channel<ArrayBuffer>();
     ch.onmessage = (buf) => onData(new Uint8Array(buf));
-    return invoke<"zle" | "line" | null>("local_pty_open", { ptyId, cols, rows, onData: ch });
+    return invoke<{ mode: "zle" | "line" | null; kind: ShellKind }>("local_pty_open", { ptyId, cols, rows, shell, onData: ch });
   },
+  /** Run a program directly, without a shell (Windows local panels). */
+  localExec: (program: string, args: string[], cwd?: string, timeoutMs?: number) =>
+    invoke<{ code: number; out: string; err: string }>("local_exec", { program, args, cwd, timeoutMs }),
+  fsOp: (op: "mkdir" | "touch" | "rename" | "remove" | "copy" | "move", paths: string[], dest?: string) =>
+    invoke<void>("fs_op", { op, paths, dest }),
   ptyWrite: (ptyId: string, data: string) => invoke<void>("pty_write", { ptyId, data }),
   ptyResize: (ptyId: string, cols: number, rows: number) =>
     invoke<void>("pty_resize", { ptyId, cols, rows }),

@@ -10,15 +10,17 @@ export interface PageDef {
   component: Component | null;
   /** Needs a connected, idle shell (runs commands in the PTY). */
   needsShell?: boolean;
+  /** Also works in Windows local tabs (CMD / PowerShell). */
+  windows?: boolean;
   /** Pinned to the bottom of the bar. */
   bottom?: boolean;
 }
 
 export const pages: PageDef[] = [
   { id: "terminal", icon: "terminal", title: "Terminal", component: null },
-  { id: "files", icon: "folder", title: "Dosyalar", component: defineAsyncComponent(() => import("./files/FilesPage.vue")), needsShell: true },
-  { id: "docker", icon: "box", title: "Docker", component: defineAsyncComponent(() => import("./docker/DockerPage.vue")), needsShell: true },
-  { id: "system", icon: "gauge", title: "Sistem", component: defineAsyncComponent(() => import("./system/SystemPage.vue")), needsShell: true },
+  { id: "files", windows: true, icon: "folder", title: "Dosyalar", component: defineAsyncComponent(() => import("./files/FilesPage.vue")), needsShell: true },
+  { id: "docker", windows: true, icon: "box", title: "Docker", component: defineAsyncComponent(() => import("./docker/DockerPage.vue")), needsShell: true },
+  { id: "system", windows: true, icon: "gauge", title: "Sistem", component: defineAsyncComponent(() => import("./system/SystemPage.vue")), needsShell: true },
   { id: "processes", icon: "cpu", title: "Süreçler", component: defineAsyncComponent(() => import("./processes/ProcessesPage.vue")), needsShell: true },
   { id: "ports", icon: "ports", title: "Portlar", component: defineAsyncComponent(() => import("./ports/PortsPage.vue")), needsShell: true },
   { id: "logs", icon: "scroll", title: "Loglar", component: defineAsyncComponent(() => import("./logs/LogsPage.vue")), needsShell: true },

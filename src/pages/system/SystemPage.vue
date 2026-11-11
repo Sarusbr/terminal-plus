@@ -3,7 +3,8 @@ import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { sh } from "../../lib/shell";
 import { activeTab, type Tab } from "../../stores/tabs";
 import Icon from "../../components/Icon.vue";
-import { collect, type SysInfo } from "./collect";
+import { collect, collectWindows, type SysInfo } from "./collect";
+import { isWinLocal } from "../../lib/winlocal";
 import { fmtBytes } from "../../stores/transfers";
 
 const tab = ref<Tab | undefined>(activeTab.value);
@@ -19,7 +20,7 @@ async function load() {
   if (!tab.value) return;
   loading.value = true;
   try {
-    info.value = await collect(sh(tab.value));
+    info.value = isWinLocal(tab.value) ? await collectWindows() : await collect(sh(tab.value));
     error.value = "";
   } catch (e) {
     error.value = String((e as Error)?.message ?? e);
@@ -72,7 +73,7 @@ onBeforeUnmount(() => { alive = false; clearTimeout(timer); });
           <div class="center"><b>{{ Math.round(pct(info.memUsed, info.memTotal)) }}%</b><span>RAM · {{ fmtBytes(info.memUsed) }} / {{ fmtBytes(info.memTotal) }}</span></div>
         </div>
         <div class="facts">
-          <div><span>Yük</span><b>{{ info.load.map((l) => l.toFixed(2)).join('  ') }}</b>
+          <div v-if="info.load.length"><span>Yük</span><b>{{ info.load.map((l) => l.toFixed(2)).join('  ') }}</b>
             <i class="mini-bar"><i :class="level(pct(info.load[0] ?? 0, info.cores))" :style="{ width: Math.min(100, pct(info.load[0] ?? 0, info.cores)) + '%' }" /></i></div>
           <div><span>Çalışma süresi</span><b>{{ uptime(info.uptime) }}</b></div>
           <div v-if="info.swapTotal"><span>Swap</span><b>{{ fmtBytes(info.swapUsed) }} / {{ fmtBytes(info.swapTotal) }}</b>

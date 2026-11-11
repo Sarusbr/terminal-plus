@@ -27,23 +27,32 @@ fn set_window_effect(window: tauri::WebviewWindow, enabled: bool, level: Option<
     }
     #[cfg(target_os = "windows")]
     {
-        use window_vibrancy::{apply_acrylic, apply_mica, clear_acrylic, clear_mica};
+        use window_vibrancy::{apply_acrylic, apply_blur, apply_mica, clear_acrylic, clear_blur, clear_mica};
+        let _ = clear_mica(&window);
+        let _ = clear_acrylic(&window);
+        let _ = clear_blur(&window);
         if enabled {
-            let _ = clear_mica(&window);
-            let _ = clear_acrylic(&window);
-            let acrylic = |a| apply_acrylic(&window, Some((18, 18, 18, a))).map_err(|e| e.to_string());
-            match level.as_str() {
-                "light" => {
-                    if apply_mica(&window, Some(true)).is_err() {
-                        acrylic(160)?;
-                    }
+            // Mica: Windows 11 · Acrylic: Windows 10 1809+ / 11 · Blur: older Windows 10.
+            // Try the preferred one for the level, fall back to whatever this Windows supports.
+            let order: &[&str] = match level.as_str() {
+                "light" => &["mica", "acrylic", "blur"],
+                "strong" => &["acrylic", "blur", "mica"],
+                _ => &["acrylic", "mica", "blur"],
+            };
+            let tint = if level == "strong" { 60 } else { 120 };
+            let mut last = String::from("unsupported");
+            for effect in order {
+                let r = match *effect {
+                    "mica" => apply_mica(&window, Some(true)),
+                    "acrylic" => apply_acrylic(&window, Some((18, 18, 18, tint))),
+                    _ => apply_blur(&window, Some((18, 18, 18, tint))),
+                };
+                match r {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = format!("{effect}: {e}"),
                 }
-                "strong" => acrylic(60)?,
-                _ => acrylic(120)?,
             }
-        } else {
-            let _ = clear_mica(&window);
-            let _ = clear_acrylic(&window);
+            return Err(last);
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -94,6 +103,9 @@ pub fn run() {
             fsops::file_write,
             fsops::temp_write,
             fsops::local_list_dir,
+            fsops::fs_op,
+            local::local_shells,
+            local::local_exec,
             ssh::pty_busy,
             local::local_info,
             local::local_pty_open,

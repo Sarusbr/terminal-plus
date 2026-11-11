@@ -15,6 +15,7 @@ import { ui, toast } from "./stores/ui";
 import TransferDialog from "./components/TransferDialog.vue";
 import { initTransferEvents, startTransfer, filesCwd } from "./stores/transfers";
 import { sh } from "./lib/shell";
+import { isWinLocal, cwdOf } from "./lib/winlocal";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 const ready = ref(false);
@@ -34,7 +35,7 @@ const dropping = ref(false);
 function dropTarget() {
   const t = activeTab.value;
   if (!t || t.status !== "connected") return null;
-  if (t.kind === "local" && platform.os === "windows") return null;
+  // Windows local: drop = copy into the shell's directory (reported by the prompt).
   return t;
 }
 async function initDrop() {
@@ -48,7 +49,9 @@ async function initDrop() {
       if (!t || !p.paths.length) return;
       try {
         // Files page cwd if it's showing this tab, otherwise the shell's cwd.
-        const dest = (ui.page === "files" && filesCwd[t.id]) || (await sh(t).ok("pwd")).trim();
+        const dest = (ui.page === "files" && filesCwd[t.id])
+          || (isWinLocal(t) ? cwdOf(t) ?? "" : (await sh(t).ok("pwd")).trim());
+        if (!dest) return toast("Hedef klasör bilinmiyor");
         startTransfer(t, "up", p.paths, dest);
       } catch (err) {
         toast(String((err as Error)?.message ?? err));

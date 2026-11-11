@@ -1,7 +1,9 @@
-// Docker CLI access through the shell runner. Falls back to sudo when the socket is
-// not accessible to the user (the choice is remembered per tab).
-import { sh, q, type Shell } from "../../lib/shell";
-import type { Tab } from "../../stores/tabs";
+// Docker CLI access. POSIX shells: typed through the shell runner (sudo fallback when the
+// socket isn't accessible, remembered per tab). Windows local: docker.exe run directly.
+import { api } from "../../lib/api";
+import { sh, q } from "../../lib/shell";
+import { isWinLocal, cwdOf } from "../../lib/winlocal";
+import { paneHandles, type Tab } from "../../stores/tabs";
 
 const useSudo = new WeakMap<Tab, boolean>();
 
@@ -9,37 +11,62 @@ export class DockerError extends Error {
   constructor(public kind: "missing" | "daemon" | "other", msg: string) { super(msg); }
 }
 
-export function docker(tab: Tab) {
-  const shell: Shell = sh(tab);
-  const prefix = () => (useSudo.get(tab) ? "sudo -p '[sudo] password for %u: ' docker" : "docker");
+/** Quote for cmd.exe / PowerShell command lines (visible commands only). */
+const winQuote = (a: string) => (/[\s"&|<>^;]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
 
-  async function run(args: string, timeout = 30000): Promise<string> {
-    let r = await shell.run(`${prefix()} ${args}`, timeout);
-    if (r.code !== 0 && !useSudo.get(tab) && /permission denied.*docker\.sock|docker\.sock.*permission denied/is.test(r.out)) {
-      useSudo.set(tab, true);
-      r = await shell.run(`${prefix()} ${args}`, timeout);
+export function docker(tab: Tab) {
+  const win = isWinLocal(tab);
+  const prefix = () => (useSudo.get(tab) ? "sudo -p '[sudo] password for %u: ' docker" : "docker");
+  // Quote only when needed so commands typed into the terminal stay readable.
+  const arg = (a: string) => (/^[\w@%+=:,./-]+$/.test(a) ? a : q(a));
+  const line = (args: string[]) => `${prefix()} ${args.map(arg).join(" ")}`;
+
+  async function exec(args: string[], timeout: number): Promise<{ code: number; out: string }> {
+    if (win) {
+      try {
+        const r = await api.localExec("docker", args, cwdOf(tab), timeout);
+        return { code: r.code, out: r.out + (r.err ? "\n" + r.err : "") };
+      } catch (e) {
+        if (String(e).includes("NOT_FOUND")) return { code: 127, out: "docker: command not found" };
+        throw e;
+      }
     }
-    if (r.code === 127 || /command not found|not found: docker/i.test(r.out) && r.code !== 0)
+    return sh(tab).run(line(args), timeout);
+  }
+
+  async function run(args: string[], timeout = 30000): Promise<string> {
+    let r = await exec(args, timeout);
+    if (r.code !== 0 && !win && !useSudo.get(tab) && /permission denied.*docker\.sock|docker\.sock.*permission denied/is.test(r.out)) {
+      useSudo.set(tab, true);
+      r = await exec(args, timeout);
+    }
+    if (r.code === 127 || (/command not found|not found: docker|is not recognized/i.test(r.out) && r.code !== 0))
       throw new DockerError("missing", "Docker bulunamadı");
     if (r.code !== 0) {
-      const msg = r.out.trim().split("\n").slice(-2).join("\n") || `exit ${r.code}`;
-      throw new DockerError(/Cannot connect to the Docker daemon|daemon running/i.test(msg) ? "daemon" : "other", msg);
+      const msg = r.out.trim().split(/\r?\n/).slice(-2).join("\n") || `exit ${r.code}`;
+      throw new DockerError(/Cannot connect to the Docker daemon|daemon running|docker_engine|pipe/i.test(msg) ? "daemon" : "other", msg);
     }
     return r.out;
   }
 
+  /** Type a docker command into the terminal, visibly (exec -it, logs -f). */
+  function type(args: string[]) {
+    if (win) paneHandles.get(tab.activePane)?.write(["docker", ...args.map(winQuote)].join(" ") + "\r");
+    else sh(tab).type(line(args));
+  }
+
   const jsonLines = <T>(out: string): T[] =>
-    out.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).map((l) => {
+    out.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith("{")).map((l) => {
       try { return JSON.parse(l) as T; } catch { return null; }
     }).filter(Boolean) as T[];
 
   return {
     run,
+    type,
     jsonLines,
     exec(id: string) {
-      shell.type(`${prefix()} exec -it ${q(id)} sh -c 'command -v bash >/dev/null && exec bash || exec sh'`);
+      type(["exec", "-it", id, "sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"]);
     },
-    q,
   };
 }
 

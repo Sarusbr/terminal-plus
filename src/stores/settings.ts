@@ -1,6 +1,7 @@
 import { reactive, watch } from "vue";
 import { api } from "../lib/api";
 import { applyThemeCss, themes, type Theme } from "../lib/themes";
+import { toast } from "./ui";
 
 export interface Settings {
   theme: string;
@@ -15,6 +16,8 @@ export interface Settings {
   bell: "none" | "visual";
   blurLevel: "light" | "medium" | "strong";
   ligatures: boolean;
+  /** Local shell id from `local_shells` ("" = first: CMD on Windows, $SHELL elsewhere). */
+  localShell: string;
   /** Per-token overrides on top of the selected theme. */
   custom: { bg?: string; fg?: string; accent?: string; cursor?: string; selection?: string };
 }
@@ -32,6 +35,7 @@ const defaults: Settings = {
   bell: "visual",
   blurLevel: "medium",
   ligatures: false,
+  localShell: "",
   custom: {},
 };
 
@@ -53,14 +57,21 @@ export async function loadSettings() {
   const saved = await api.storeLoad<Partial<Settings>>("settings").catch(() => null);
   if (saved) Object.assign(settings, { ...saved, custom: { ...(saved.custom ?? {}) } });
   apply();
-  api.setWindowEffect(settings.blur, settings.blurLevel).catch(() => {});
+  applyEffect();
 
   watch(settings, () => {
     apply();
     clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => api.storeSave("settings", { ...settings }), 300);
   }, { deep: true });
-  watch(() => [settings.blur, settings.blurLevel] as const, ([b, l]) => api.setWindowEffect(b, l).catch(() => {}));
+  watch(() => [settings.blur, settings.blurLevel] as const, applyEffect);
+}
+
+/** Native blur behind the window; tell the user when this OS can't do it. */
+function applyEffect() {
+  api.setWindowEffect(settings.blur, settings.blurLevel).catch((e) => {
+    if (settings.blur) toast(`Pencere efekti uygulanamadı (${String(e)}). Opaklık ayarı yine çalışır.`);
+  });
 }
 
 function apply() {

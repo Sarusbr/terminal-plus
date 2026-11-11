@@ -1,11 +1,25 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { tabs, tabLabel, closeTab, moveTab, paneHandles, openLocal } from "../stores/tabs";
+import { tabs, tabLabel, closeTab, moveTab, paneHandles, openLocal, localShells, loadLocalShells } from "../stores/tabs";
+import { settings } from "../stores/settings";
 import { ui } from "../stores/ui";
 import Icon from "./Icon.vue";
 
 const strip = ref<HTMLDivElement>();
+const menu = ref(false);
+
+/** "+": one shell → open it; several (Windows: CMD / PowerShell) → small menu. */
+async function plus() {
+  if (!localShells.list.length) await loadLocalShells();
+  if (localShells.list.length > 1) menu.value = !menu.value;
+  else openLocal();
+}
+function pick(id: string) {
+  menu.value = false;
+  openLocal(id);
+}
+const isDefault = (id: string) => (settings.localShell || localShells.list[0]?.id) === id;
 const toggleMax = () => getCurrentWindow().toggleMaximize().catch(() => {});
 const dragging = ref("");
 
@@ -60,9 +74,19 @@ function down(e: PointerEvent, id: string) {
       </div>
       <div class="drag" data-tauri-drag-region @dblclick="toggleMax" />
     </div>
-    <button class="ib add" data-tip="Yerel terminal" data-tip-pos="bottom" @click="openLocal()">
-      <Icon name="plus" :size="15" />
-    </button>
+    <div class="plus">
+      <button class="ib add" :class="{ on: menu }" :data-tip="menu ? undefined : 'Yerel terminal'" data-tip-pos="bottom" @click="plus">
+        <Icon name="plus" :size="15" />
+      </button>
+      <div v-if="menu" class="menu-backdrop" @mousedown="menu = false" />
+      <div v-if="menu" class="menu" @keydown.esc="menu = false">
+        <button v-for="s in localShells.list" :key="s.id" class="mi" @click="pick(s.id)">
+          <Icon name="terminal" :size="13" />
+          <span>{{ s.name }}</span>
+          <i v-if="isDefault(s.id)" class="def">varsayılan</i>
+        </button>
+      </div>
+    </div>
     <button class="ib add" data-tip="Sunucuya bağlan" data-tip-pos="bottom" @click="ui.page = 'servers'">
       <Icon name="server" :size="15" />
     </button>
@@ -97,5 +121,18 @@ function down(e: PointerEvent, id: string) {
 .tab:hover .close, .tab.current .close { opacity: 1; }
 .close:hover { color: var(--fg); background: rgb(var(--fg-rgb) / 0.08); }
 .drag { flex: 1 0 48px; }
-.add { width: var(--header-h); height: auto; border-radius: 0; flex: none; }
+.add { width: var(--header-h); height: 100%; border-radius: 0; flex: none; }
+.add.on { color: var(--fg); background: rgb(var(--fg-rgb) / 0.07); }
+.plus { position: relative; display: flex; }
+.menu-backdrop { position: fixed; inset: 0; z-index: 60; }
+.menu {
+  position: absolute; top: calc(100% + 4px); right: 4px; z-index: 61; min-width: 170px; padding: 4px;
+  border: 1px solid var(--line); border-radius: 8px; background: rgb(var(--bg-rgb) / 0.98);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.35); animation: pop .1s ease-out;
+}
+.mi { width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px; font-size: 12.5px; color: var(--fg); text-align: left; }
+.mi:hover { background: rgb(var(--fg-rgb) / 0.07); }
+.mi span { flex: 1; }
+.def { font-style: normal; font-size: 10.5px; color: var(--muted); }
+@keyframes pop { from { opacity: 0; transform: translateY(-3px); } }
 </style>

@@ -15,12 +15,6 @@ use crate::ssh::{PtyCmd, PtyExit, SshState};
 fn default_shell() -> String {
     #[cfg(windows)]
     {
-        // Prefer PowerShell 7, then Windows PowerShell.
-        for p in ["pwsh.exe", "powershell.exe"] {
-            if which(p) {
-                return p.into();
-            }
-        }
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
     }
     #[cfg(not(windows))]
@@ -29,6 +23,58 @@ fn default_shell() -> String {
             if cfg!(target_os = "macos") { "/bin/zsh".into() } else { "/bin/bash".into() }
         })
     }
+}
+
+/// Shells offered in the "+" menu: (id, executable, label).
+fn shell_options() -> Vec<(&'static str, String, String)> {
+    #[cfg(windows)]
+    {
+        let mut v = vec![
+            ("cmd", default_shell(), "CMD".to_string()),
+            ("powershell", "powershell.exe".to_string(), "PowerShell".to_string()),
+        ];
+        if which("pwsh.exe") {
+            v.push(("pwsh", "pwsh.exe".to_string(), "PowerShell 7".to_string()));
+        }
+        v
+    }
+    #[cfg(not(windows))]
+    {
+        let sh = default_shell();
+        let name = std::path::Path::new(&sh).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        vec![("default", sh, name)]
+    }
+}
+
+#[derive(Serialize)]
+pub struct ShellOption {
+    id: &'static str,
+    name: String,
+}
+
+#[tauri::command]
+pub fn local_shells() -> Vec<ShellOption> {
+    shell_options().into_iter().map(|(id, _, name)| ShellOption { id, name }).collect()
+}
+
+/// PowerShell: report the cwd to the terminal (OSC 9;9) before the user's own prompt, and
+/// keep space-prefixed lines out of PSReadLine history.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PS_INIT: &str = r#"$global:__tp_prompt = $function:prompt
+function global:prompt {
+  $e = [char]27
+  $loc = $executionContext.SessionState.Path.CurrentLocation
+  $p = if ($loc.Provider.Name -eq 'FileSystem') { $loc.ProviderPath } else { '' }
+  "$e]9;9;$p$e" + (& $global:__tp_prompt)
+}
+if (Get-Module PSReadLine) { Set-PSReadLineOption -AddToHistoryHandler { param($line) -not $line.StartsWith(' ') } }
+"#;
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ps_encoded(script: &str) -> String {
+    use base64::Engine;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
 }
 
 #[cfg(windows)]
@@ -120,22 +166,52 @@ pub fn local_info() -> LocalInfo {
     LocalInfo { shell: name, user }
 }
 
+#[derive(Serialize)]
+pub struct LocalOpen {
+    /// Panel run mode (runner.ts): "zle" (zsh), "line" (bash) or null.
+    mode: Option<&'static str>,
+    /// Shell kind: "cmd" | "powershell" | "posix"
+    kind: &'static str,
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn local_pty_open<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, SshState>,
     pty_id: String,
     cols: u16,
     rows: u16,
+    shell: Option<String>,
     on_data: Channel<InvokeResponseBody>,
-) -> Result<Option<&'static str>, String> {
+) -> Result<LocalOpen, String> {
     let size = PtySize { rows: rows.max(2), cols: cols.max(2), pixel_width: 0, pixel_height: 0 };
     let pair = native_pty_system().openpty(size).map_err(|e| e.to_string())?;
 
-    let shell = default_shell();
+    let opts = shell_options();
+    let (shell_id, shell) = opts
+        .iter()
+        .find(|(id, _, _)| Some(*id) == shell.as_deref())
+        .or(opts.first())
+        .map(|(id, exe, _)| (*id, exe.clone()))
+        .unwrap_or(("default", default_shell()));
     let mut cmd = CommandBuilder::new(&shell);
-    // Run mode for panel commands (see runner.ts): "zle" for zsh, "line" for bash.
     let mut mode = None;
+    let mut kind = "posix";
+    #[cfg(windows)]
+    {
+        if shell_id == "cmd" {
+            // Prompt reports the cwd (OSC 9;9) — same trick Windows Terminal documents.
+            let user = std::env::var("PROMPT").unwrap_or_else(|_| "$P$G".into());
+            cmd.env("PROMPT", format!("$e]9;9;$P$e\\{user}"));
+            kind = "cmd";
+        } else {
+            cmd.args(["-NoLogo", "-NoExit", "-EncodedCommand", &ps_encoded(PS_INIT)]);
+            kind = "powershell";
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = shell_id;
     #[cfg(not(windows))]
     match integration_dir(&app, &shell) {
         Some((dir, "zsh")) => {
@@ -152,6 +228,7 @@ pub fn local_pty_open<R: Runtime>(
         }
         None => cmd.arg("-l"), // login shell: loads the user's profile like Terminal.app does
     }
+    let _ = &mut kind;
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "TerminalPlus");
@@ -221,7 +298,35 @@ pub fn local_pty_open<R: Runtime>(
         }
         let _ = app.emit("pty-exit", PtyExit { pty_id, code: code.or(Some(0)) });
     });
-    Ok(mode)
+    Ok(LocalOpen { mode, kind })
+}
+
+#[derive(Serialize)]
+pub struct ExecOut {
+    code: i32,
+    out: String,
+    err: String,
+}
+
+/// Run a program directly (no shell, no terminal) — used by panels on Windows local tabs.
+#[tauri::command]
+pub async fn local_exec(program: String, args: Vec<String>, cwd: Option<String>, timeout_ms: Option<u64>) -> Result<ExecOut, String> {
+    let mut c = tokio::process::Command::new(&program);
+    c.args(&args).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+        c.current_dir(d);
+    }
+    #[cfg(windows)]
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+    let out = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000)), c.output())
+        .await
+        .map_err(|_| "TIMEOUT".to_string())?
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { format!("NOT_FOUND: {program}") } else { e.to_string() })?;
+    Ok(ExecOut {
+        code: out.status.code().unwrap_or(-1),
+        out: String::from_utf8_lossy(&out.stdout).into_owned(),
+        err: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -241,7 +346,7 @@ mod tests {
             }
             Ok(())
         });
-        let mode = local_pty_open(h.clone(), h.state(), "l1".into(), 80, 24, ch).unwrap();
+        let mode = local_pty_open(h.clone(), h.state(), "l1".into(), 80, 24, None, ch).unwrap().mode;
         let zsh = default_shell().ends_with("zsh");
         if zsh {
             assert_eq!(mode, Some("zle"));

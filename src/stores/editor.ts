@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import { sh, q, isPermissionError } from "../lib/shell";
 import type { Tab } from "./tabs";
 import { ui, toast } from "./ui";
+import { platform } from "./settings";
 
 export interface EditorDoc {
   tab: Tab;
@@ -26,7 +27,7 @@ const target = (tab: Tab) => (tab.kind === "local" ? null : tab.connId);
 
 /** Resolve relative / ~ paths against the shell's cwd and $HOME. */
 async function resolvePath(tab: Tab, raw: string): Promise<string> {
-  if (raw.startsWith("/")) return raw;
+  if (raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw)) return raw;
   const out = await sh(tab).ok(`pwd; printf '%s\\n' "$HOME"`);
   const [cwd, home] = out.split("\n").map((s) => s.trim());
   if (raw === "~") return home;
@@ -57,7 +58,7 @@ export async function openEditor(tab: Tab, rawPath: string, opts: { sudo?: boole
       doc.exists = r.exists;
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
-      if (!msg.includes("PERMISSION_DENIED")) throw e;
+      if (!msg.includes("PERMISSION_DENIED") || (platform.os === "windows" && tab.kind === "local")) throw e;
       doc.sudo = true;
       const out = await sh(tab).ok(`sudo -p '[sudo] password for %u: ' cat -- ${q(doc.path)} | base64`, 60000);
       text = b64ToText(out);
@@ -83,6 +84,7 @@ export async function saveEditor(): Promise<boolean> {
         await api.fileWrite(target(doc.tab), doc.path, content);
       } catch (e) {
         if (!String(e).includes("PERMISSION_DENIED")) throw e;
+        if (platform.os === "windows" && doc.tab.kind === "local") throw new Error("Yetki yok (yönetici izni gerekli)");
         viaSudo = true;
       }
     }

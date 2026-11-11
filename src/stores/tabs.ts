@@ -1,7 +1,8 @@
 // Tabs, split-pane layout trees and the SSH connect flow.
 import { reactive, computed } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { api, uid } from "../lib/api";
+import { api, uid, type ShellKind } from "../lib/api";
+import { settings } from "./settings";
 import type { Server } from "./servers";
 import { confirmHostKey, prompt, ui } from "./ui";
 import type { RunOpts, RunResult } from "../lib/runner";
@@ -16,6 +17,8 @@ export interface PaneState {
   /** Local only: a foreground program other than the shell owns the tty. */
   busy?: boolean;
   ptyId?: string;
+  /** Working directory reported by the shell prompt (OSC 9;9 / OSC 7). */
+  cwd?: string;
 }
 
 export type TabStatus = "connecting" | "connected" | "disconnected" | "ended" | "error";
@@ -24,6 +27,9 @@ export interface Tab {
   id: string;
   /** "local" = shell on this computer, "ssh" = remote server. */
   kind: "local" | "ssh";
+  /** Local shell id ("cmd", "powershell", …) and what kind of shell it turned out to be. */
+  shell?: string;
+  shellKind?: ShellKind;
   server: Server;
   connId: string;
   status: TabStatus;
@@ -64,15 +70,25 @@ export function tabLabel(t: Tab) {
 
 const leaf = (): PaneNode => ({ kind: "leaf", id: uid() });
 
-let localInfo: { shell: string; user: string } | null = null;
+export const localShells = reactive<{ list: { id: string; name: string }[]; user: string }>({ list: [], user: "" });
 
-/** Open a shell on this computer (no SSH). */
-export async function openLocal() {
-  localInfo ??= await api.localInfo().catch(() => ({ shell: "shell", user: "" }));
+export async function loadLocalShells() {
+  const [list, info] = await Promise.all([
+    api.localShells().catch(() => []),
+    api.localInfo().catch(() => ({ shell: "shell", user: "" })),
+  ]);
+  localShells.list = list.length ? list : [{ id: "default", name: info.shell }];
+  localShells.user = info.user;
+}
+
+/** Open a shell on this computer (no SSH). `shellId` from the "+" menu; default from settings. */
+export async function openLocal(shellId?: string) {
+  if (!localShells.list.length) await loadLocalShells();
+  const sh = localShells.list.find((s) => s.id === (shellId ?? settings.localShell)) ?? localShells.list[0];
   const root = leaf();
   const tab: Tab = reactive({
-    id: uid(), kind: "local" as const,
-    server: { id: "local", name: localInfo.shell, host: "localhost", port: 0, user: localInfo.user, auth: "key" as const, tags: [] },
+    id: uid(), kind: "local" as const, shell: sh.id,
+    server: { id: "local", name: sh.name, host: "localhost", port: 0, user: localShells.user, auth: "key" as const, tags: [] },
     connId: "", status: "connected" as const,
     layout: root, panes: { [root.id]: { alt: false } }, activePane: root.id, gen: 1,
   }) as Tab;
