@@ -42,29 +42,50 @@ jobs:
           path: openconnect-macos-aarch64.zip
 
   windows:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: msys2 {0}
+    # MSYS2 dropped openconnect; cross-compile like upstream does (Fedora MinGW toolchain).
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    timeout-minutes: 40
     steps:
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-openconnect zip unzip curl
-      - name: Bundle openconnect.exe + DLLs + Wintun + vpnc-script
+      - name: Toolchain
         run: |
+          dnf install -y --setopt=install_weak_deps=False git autoconf automake libtool gettext-devel pkgconf-pkg-config \
+            make zip unzip curl findutils mingw64-gcc mingw64-gnutls mingw64-libxml2 mingw64-zlib
+      - name: Build openconnect.exe
+        run: |
+          OC_TAG=$(git ls-remote --tags --refs https://gitlab.com/openconnect/openconnect.git 'v9.*' | sed 's|.*/||' | sort -V | tail -1)
+          echo "openconnect $OC_TAG"
+          git clone --depth 1 --branch "$OC_TAG" https://gitlab.com/openconnect/openconnect.git src
+          cd src
+          ./autogen.sh
+          mingw64-configure --disable-nls --without-libproxy --without-stoken --without-libpcsclite \
+            --without-gssapi --disable-docs --with-vpnc-script=vpnc-script-win.js
+          mingw64-make -j"$(nproc)"
+      - name: Bundle exe + DLLs + Wintun + vpnc-script
+        run: |
+          set -e
+          SYS=/usr/x86_64-w64-mingw32/sys-root/mingw/bin
           mkdir -p out/bin
-          cp /mingw64/bin/openconnect.exe out/bin/
-          # Every DLL openconnect loads from mingw64 (ldd is recursive).
-          ldd /mingw64/bin/openconnect.exe | awk '/mingw64/ {print $3}' | sort -u | xargs -I{} cp {} out/bin/
+          cp src/.libs/openconnect.exe out/bin/
+          cp src/.libs/libopenconnect-*.dll out/bin/
+          # Copy every MinGW DLL the binaries import, recursively.
+          deps() { x86_64-w64-mingw32-objdump -p "$1" | awk '/DLL Name:/ {print $3}'; }
+          todo="out/bin/openconnect.exe $(ls out/bin/*.dll)"
+          while [ -n "$todo" ]; do
+            next=""
+            for f in $todo; do
+              for d in $(deps "$f"); do
+                if [ -f "$SYS/$d" ] && [ ! -f "out/bin/$d" ]; then cp "$SYS/$d" out/bin/; next="$next out/bin/$d"; fi
+              done
+            done
+            todo="$next"
+          done
+          ls out/bin
           curl -fsSL "$WINTUN_URL" -o wintun.zip
           echo "$WINTUN_SHA256  wintun.zip" | sha256sum -c -
           unzip -q wintun.zip
           cp wintun/bin/amd64/wintun.dll out/bin/
           curl -fsSL https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script-win.js -o out/vpnc-script-win.js
-          ./out/bin/openconnect.exe --version
           (cd out && zip -qr ../openconnect-windows-x86_64.zip .)
       - uses: actions/upload-artifact@v4
         with:
