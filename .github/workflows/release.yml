@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 → builds macOS (Apple Silicon + Intel), Windows and Linux,
+# Push a tag like v0.1.0 → builds macOS (Apple Silicon + Intel) and Windows,
 # uploads installers with stable file names to the GitHub Release for that tag.
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
         run: |
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --title "Terminal Plus $TAG" \
-              --notes "Kurulum dosyaları aşağıda. macOS: .dmg · Windows: -setup.exe veya .msi · Linux: .AppImage veya .deb"
+              --notes "Kurulum dosyaları aşağıda. macOS: .dmg · Windows: -setup.exe veya .msi"
 
   build:
     needs: create-release
@@ -47,21 +47,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             bundles: nsis,msi
             label: windows-x64
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
-            label: linux-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-
-      - name: Linux system packages
-        if: runner.os == 'Linux'
-        timeout-minutes: 12
-        run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libxdo-dev
 
       - uses: actions/setup-node@v5
         with:
@@ -97,8 +86,6 @@ jobs:
             macos-*)      cp "$B"/dmg/*.dmg "out/TerminalPlus-${{ matrix.label }}.dmg" ;;
             windows-x64)  cp "$B"/nsis/*-setup.exe "out/TerminalPlus-windows-x64-setup.exe"
                           cp "$B"/msi/*.msi "out/TerminalPlus-windows-x64.msi" ;;
-            linux-x64)    cp "$B"/appimage/*.AppImage "out/TerminalPlus-linux-x64.AppImage"
-                          cp "$B"/deb/*.deb "out/TerminalPlus-linux-x64.deb" ;;
           esac
           ls -la out
           gh release upload "$TAG" out/* --clobber -R "$GITHUB_REPOSITORY"

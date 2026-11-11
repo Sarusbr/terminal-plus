@@ -12,8 +12,6 @@ server: panels type standard commands (`ls`, `docker`, `ps`, …) into your own 
 | macOS — Intel | [TerminalPlus-macos-intel.dmg](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-macos-intel.dmg) |
 | Windows (kurulum) | [TerminalPlus-windows-x64-setup.exe](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-windows-x64-setup.exe) |
 | Windows (MSI) | [TerminalPlus-windows-x64.msi](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-windows-x64.msi) |
-| Linux — AppImage | [TerminalPlus-linux-x64.AppImage](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-linux-x64.AppImage) |
-| Linux — Debian/Ubuntu | [TerminalPlus-linux-x64.deb](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-linux-x64.deb) |
 
 Tüm sürümler: [Releases](https://github.com/Sarusbr/terminal-plus/releases)
 
@@ -33,7 +31,7 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-GitHub Actions tüm platformları derler ve dosyaları release'e yükler; yukarıdaki linkler
+GitHub Actions macOS ve Windows sürümlerini derler ve dosyaları release'e yükler; yukarıdaki linkler
 otomatik olarak en yeni sürümü indirir.
 
 ## Develop
@@ -53,7 +51,7 @@ Each platform is built on that platform:
 ```bash
 npm run tauri build -- --bundles app,dmg      # macOS
 npm run tauri build -- --bundles msi,nsis     # Windows
-npm run tauri build -- --bundles appimage,deb # Linux
+npm run tauri build -- --bundles appimage,deb # Linux (yerelde, CI'da yok)
 ```
 
 ## Tests
