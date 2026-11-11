@@ -1,0 +1,117 @@
+mod fsops;
+mod local;
+mod secrets;
+mod ssh;
+mod store;
+mod transfer;
+
+/// Toggle native blur behind the (transparent) window.
+#[tauri::command]
+fn set_window_effect(window: tauri::WebviewWindow, enabled: bool, level: Option<String>) -> Result<(), String> {
+    let level = level.unwrap_or_else(|| "medium".into());
+    #[cfg(target_os = "macos")]
+    {
+        use window_vibrancy::{apply_vibrancy, clear_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+        if enabled {
+            let material = match level.as_str() {
+                "light" => NSVisualEffectMaterial::UnderWindowBackground,
+                "strong" => NSVisualEffectMaterial::FullScreenUI,
+                _ => NSVisualEffectMaterial::HudWindow,
+            };
+            let _ = clear_vibrancy(&window);
+            apply_vibrancy(&window, material, Some(NSVisualEffectState::Active), None)
+                .map_err(|e| e.to_string())?;
+        } else {
+            let _ = clear_vibrancy(&window);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use window_vibrancy::{apply_acrylic, apply_mica, clear_acrylic, clear_mica};
+        if enabled {
+            let _ = clear_mica(&window);
+            let _ = clear_acrylic(&window);
+            let acrylic = |a| apply_acrylic(&window, Some((18, 18, 18, a))).map_err(|e| e.to_string());
+            match level.as_str() {
+                "light" => {
+                    if apply_mica(&window, Some(true)).is_err() {
+                        acrylic(160)?;
+                    }
+                }
+                "strong" => acrylic(60)?,
+                _ => acrylic(120)?,
+            }
+        } else {
+            let _ = clear_mica(&window);
+            let _ = clear_acrylic(&window);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = (window, enabled, level);
+    Ok(())
+}
+
+#[tauri::command]
+fn platform() -> &'static str {
+    std::env::consts::OS
+}
+
+/// One-time move of saved servers/settings from the pre-0.1 identifier's directory.
+fn migrate_config(app: &tauri::App) {
+    use tauri::Manager;
+    let Ok(new_dir) = app.path().app_config_dir() else { return };
+    let Some(old_dir) = new_dir.parent().map(|p| p.join("dev.terminalplus.app")) else { return };
+    if !old_dir.is_dir() || old_dir == new_dir {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&new_dir);
+    for f in ["servers.json", "settings.json"] {
+        let (from, to) = (old_dir.join(f), new_dir.join(f));
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            migrate_config(app);
+            Ok(())
+        })
+        .manage(ssh::SshState::default())
+        .manage(transfer::TransferState::default())
+        .invoke_handler(tauri::generate_handler![
+            set_window_effect,
+            platform,
+            transfer::transfer_start,
+            transfer::transfer_cancel,
+            fsops::file_read,
+            fsops::file_write,
+            fsops::temp_write,
+            fsops::local_list_dir,
+            ssh::pty_busy,
+            local::local_info,
+            local::local_pty_open,
+            ssh::ssh_connect,
+            ssh::ssh_hostkey_respond,
+            ssh::ssh_disconnect,
+            ssh::pty_open,
+            ssh::pty_write,
+            ssh::pty_resize,
+            ssh::pty_close,
+            ssh::pty_write_saved_password,
+            secrets::secret_set,
+            secrets::secret_delete,
+            secrets::secret_exists,
+            store::store_load,
+            store::store_save,
+            store::ssh_config_import,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Terminal Plus");
+}

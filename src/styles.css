@@ -1,0 +1,82 @@
+/* Global tokens + primitives. All colors derive from theme tokens set in themes.ts. */
+:root {
+  --bg-rgb: 22 24 29;
+  --fg-rgb: 215 218 224;
+  --bg-opacity: 0.86;
+  --fg: rgb(var(--fg-rgb));
+  --muted: #6b717d;
+  --accent: #7aa2f7;
+  --ok: #8be9a8;
+  --warn: #e5c07b;
+  --danger: #f7768e;
+  --selection: #2d323c;
+  --line: rgb(var(--fg-rgb) / 0.09);
+  --font-mono: ui-monospace, Menlo, monospace;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --header-h: 38px;
+  --bar-w: 44px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+body {
+  font: 13px/1.4 var(--font-ui); color: var(--fg);
+  -webkit-font-smoothing: antialiased; user-select: none; -webkit-user-select: none;
+}
+::selection { background: var(--selection); }
+.muted { color: var(--muted); }
+
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: default; }
+input, select {
+  font: inherit; color: var(--fg); background: rgb(var(--fg-rgb) / 0.05);
+  border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; outline: none;
+  user-select: text; -webkit-user-select: text;
+}
+input:focus, select:focus { border-color: var(--accent); }
+input[type="checkbox"], input[type="range"] { accent-color: var(--accent); padding: 0; }
+select option { background: rgb(var(--bg-rgb)); }
+
+/* macOS: room for traffic lights in the overlay title bar */
+[data-os="macos"] .tabbar .lights { width: 78px; }
+
+/* Icon button */
+.ib {
+  display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 6px;
+  color: var(--muted); transition: background .1s, color .1s;
+}
+.ib:hover:not(:disabled) { color: var(--fg); background: rgb(var(--fg-rgb) / 0.07); }
+.ib:disabled { opacity: .35; }
+.ib.danger:hover { color: var(--danger); }
+
+/* Text button */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 6px;
+  border: 1px solid var(--line); color: var(--fg); font-size: 12.5px; transition: background .1s;
+}
+.btn:hover { background: rgb(var(--fg-rgb) / 0.06); }
+.btn.primary { background: var(--accent); border-color: transparent; color: rgb(var(--bg-rgb)); }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.primary.danger { background: var(--danger); }
+
+/* Tooltips: data-tip="…" (+ data-tip-pos="left|bottom") */
+[data-tip] { position: relative; }
+[data-tip]:hover::after {
+  content: attr(data-tip); position: absolute; z-index: 50; pointer-events: none;
+  bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+  white-space: nowrap; font: 11.5px/1.3 var(--font-ui); color: var(--fg);
+  padding: 4px 8px; border-radius: 5px; border: 1px solid var(--line);
+  background: rgb(var(--bg-rgb) / 0.97); animation: tip .12s ease-out .35s backwards;
+}
+[data-tip-pos="left"]:hover::after { bottom: auto; top: 50%; left: auto; right: calc(100% + 8px); transform: translateY(-50%); }
+[data-tip-pos="right"]:hover::after { bottom: auto; top: 50%; left: calc(100% + 8px); transform: translateY(-50%); }
+[data-tip-pos="bottom"]:hover::after { bottom: auto; top: calc(100% + 6px); left: auto; right: 4px; transform: none; }
+@keyframes tip { from { opacity: 0; } }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgb(var(--fg-rgb) / 0.12); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* xterm: keep transparent so window background/blur shows through */
+.xterm, .xterm .xterm-viewport, .xterm .xterm-screen { background: transparent !important; }
+.xterm .xterm-viewport::-webkit-scrollbar-thumb { background: rgb(var(--fg-rgb) / 0.15); }

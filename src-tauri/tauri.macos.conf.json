@@ -1,0 +1,19 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Terminal Plus",
+        "width": 1100,
+        "height": 700,
+        "minWidth": 520,
+        "minHeight": 320,
+        "transparent": true,
+        "dragDropEnabled": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 19 }
+      }
+    ]
+  }
+}

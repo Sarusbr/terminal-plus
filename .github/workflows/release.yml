@@ -1,0 +1,111 @@
+name: Release
+
+# Push a tag like v0.1.0 → builds macOS (Apple Silicon + Intel), Windows and Linux,
+# uploads installers with stable file names to the GitHub Release for that tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --title "Terminal Plus $TAG" \
+              --notes "Kurulum dosyaları aşağıda. macOS: .dmg · Windows: -setup.exe veya .msi · Linux: .AppImage veya .deb"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+            label: macos-apple-silicon
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+            label: macos-intel
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            label: windows-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+            label: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libxdo-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - run: npm ci
+
+      - name: Build
+        shell: bash
+        run: |
+          VERSION="${TAG#v}"
+          npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
+            --config "{\"version\":\"$VERSION\"}"
+
+      - name: Upload installers (stable names)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          B="src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p out
+          case "${{ matrix.label }}" in
+            macos-*)      cp "$B"/dmg/*.dmg "out/TerminalPlus-${{ matrix.label }}.dmg" ;;
+            windows-x64)  cp "$B"/nsis/*-setup.exe "out/TerminalPlus-windows-x64-setup.exe"
+                          cp "$B"/msi/*.msi "out/TerminalPlus-windows-x64.msi" ;;
+            linux-x64)    cp "$B"/appimage/*.AppImage "out/TerminalPlus-linux-x64.AppImage"
+                          cp "$B"/deb/*.deb "out/TerminalPlus-linux-x64.deb" ;;
+          esac
+          ls -la out
+          gh release upload "$TAG" out/* --clobber -R "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
