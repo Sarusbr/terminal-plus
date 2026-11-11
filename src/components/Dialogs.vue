@@ -10,11 +10,13 @@ const remember = ref(true);
 const input = ref<HTMLInputElement>();
 const okBtn = ref<HTMLButtonElement>();
 
+let shownAt = 0;
 watch(d, (cur) => {
   if (!cur) return;
+  shownAt = performance.now();
   value.value = cur.kind === "prompt" ? cur.opts.value ?? "" : "";
   remember.value = true;
-  nextTick(() => (input.value ?? okBtn.value)?.focus());
+  nextTick(() => (cur.kind === "choose" ? undefined : (input.value ?? okBtn.value))?.focus());
 }, { immediate: true });
 
 function ok() {
@@ -26,6 +28,9 @@ function ok() {
   value.value = "";
 }
 function pick(v: string) {
+  // Ignore clicks/keys in the first moments: a key still held from the previous dialog
+  // must not silently choose the first option.
+  if (performance.now() - shownAt < 450) return;
   const cur = d.value;
   if (cur?.kind === "choose") closeDialog(cur, v);
 }
@@ -56,7 +61,7 @@ function cancel() {
         <div class="head"><Icon name="list" /> {{ d.opts.title }}</div>
         <div v-if="d.opts.message" class="msg">{{ d.opts.message }}</div>
         <div class="choices">
-          <button v-for="(o, i) in d.opts.options" :key="o" type="button" class="choice" :ref="(el) => { if (i === 0) okBtn = el as HTMLButtonElement }" @click="pick(o)">{{ o }}</button>
+          <button v-for="o in d.opts.options" :key="o" type="button" class="choice" @click="pick(o)">{{ o }}</button>
         </div>
       </template>
 

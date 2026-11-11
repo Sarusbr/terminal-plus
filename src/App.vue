@@ -11,7 +11,9 @@ import { pages } from "./pages/registry";
 import { loadSettings, platform, settings } from "./stores/settings";
 import { loadServers } from "./stores/servers";
 import { tabs, activeTab, paneHandles, splitPane, closePane, initTabEvents, openLocal } from "./stores/tabs";
-import { ui, toast } from "./stores/ui";
+import { ui, toast, confirm } from "./stores/ui";
+import { invoke } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import TransferDialog from "./components/TransferDialog.vue";
 import { initVpnEvents, loadVpn } from "./stores/vpn";
 import { initTransferEvents, startTransfer, filesCwd } from "./stores/transfers";
@@ -27,6 +29,7 @@ onMounted(async () => {
   initDrop();
   ready.value = true;
   openLocal(); // start with a local shell, like any terminal app
+  reportCrash();
   window.addEventListener("keydown", onKey, true);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
@@ -59,6 +62,18 @@ async function initDrop() {
       }
     }
   });
+}
+
+/** A panic recorded by the previous session: show it once, offer to copy it. */
+async function reportCrash() {
+  const text = await invoke<string | null>("take_crash_log").catch(() => null);
+  if (!text) return;
+  const ok = await confirm({
+    title: "Uygulama önceki oturumda beklenmedik şekilde kapandı",
+    message: text.trim().split("\n").slice(-3).join("\n"),
+    okText: "Hata kaydını kopyala",
+  });
+  if (ok) writeText(text).then(() => toast("Hata kaydı kopyalandı"));
 }
 
 function focusActive() {

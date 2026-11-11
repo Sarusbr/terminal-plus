@@ -128,6 +128,26 @@ fn push_log(c: &Conn, line: &str) {
     }
 }
 
+/// Run a VPN worker; if it panics, report it on the connection instead of losing it.
+fn guarded<R: Runtime>(app: AppHandle<R>, id: String, c: Arc<Conn>, f: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            let msg = e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "bilinmeyen".into());
+            push_log(&c, &format!("İç hata: {msg}"));
+            {
+                let mut s = c.status.lock().unwrap_or_else(|p| p.into_inner());
+                s.state = "error".into();
+                s.error = Some(format!("İç hata: {msg}"));
+                s.error_kind = Some("other".into());
+            }
+            stop(&c);
+            finish(&app, &id, &c);
+        }
+    });
+}
+
 /// Wait until something listens on 127.0.0.1:`port`.
 fn wait_port(port: u16, max: Duration) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -517,7 +537,8 @@ fn start_root<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser:
     }
 
     let (a, c, id, p) = (app.clone(), conn.clone(), id.to_string(), parser);
-    std::thread::spawn(move || {
+    let (ga, gid, gc) = (a.clone(), id.clone(), c.clone());
+    guarded(ga, gid, gc, move || {
         let ok = elevate(&script);
         if let Err(e) = ok {
             {
@@ -706,7 +727,8 @@ impl NonBlock for std::fs::OpenOptions {
 #[cfg(windows)]
 fn start_elevated_windows<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser: Arc<Mutex<Box<dyn Parser>>>, l: Launch) -> Result<(), String> {
     let (a, c, id, p) = (app.clone(), conn, id.to_string(), parser);
-    std::thread::spawn(move || {
+    let (ga, gid, gc) = (a.clone(), id.clone(), c.clone());
+    guarded(ga, gid, gc, move || {
         let Some(vars) = authenticate(&c, &a, &p, &l) else {
             finish(&a, &id, &c);
             return;
@@ -746,12 +768,21 @@ fn tunnel_windows<R: Runtime>(a: &AppHandle<R>, id: &str, c: &Arc<Conn>, p: &Arc
 
     // Hand the cookie to the elevated wrapper once it connects, then close the pipe.
     let cookie = vars.get("COOKIE").cloned().unwrap_or_default();
-    let server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(format!(r"\\.\pipe\{pipe_name}"))
-        .map_err(|e| e.to_string())?;
+    // Created inside the async runtime: tokio's named pipes need its reactor, and this
+    // function runs on a plain thread (doing it here panicked and closed the app).
+    let path = format!(r"\\.\pipe\{pipe_name}");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     tauri::async_runtime::spawn(async move {
-        let mut server = server;
+        let mut server = match ServerOptions::new().first_pipe_instance(true).create(&path) {
+            Ok(s) => {
+                let _ = ready_tx.send(Ok(()));
+                s
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e.to_string()));
+                return;
+            }
+        };
         let connected = tokio::time::timeout(Duration::from_secs(120), server.connect()).await;
         if matches!(connected, Ok(Ok(()))) {
             let _ = server.write_all(format!("{cookie}\n").as_bytes()).await;
@@ -759,6 +790,7 @@ fn tunnel_windows<R: Runtime>(a: &AppHandle<R>, id: &str, c: &Arc<Conn>, p: &Arc
             let _ = server.disconnect();
         }
     });
+    ready_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "named pipe oluşturulamadı".to_string())??;
 
     // Tunnel arguments: protocol + script from the profile, the rest from --authenticate.
     let winarg = |a: &str| if a.contains([' ', '"']) { format!("\"{}\"", a.replace('"', "\\\"")) } else { a.to_string() };
@@ -1212,6 +1244,28 @@ echo 'Configured as 10.9.9.9, with SSL connected'\ntrap 'exit 0' INT TERM\nwhile
         unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
         let _ = child.wait();
         let _ = std::process::Command::new("pkill").args(["-f", &format!("ocproxy -D {port}")]).status();
+    }
+
+    /// A panic in a VPN worker must not take the app down: it becomes an error + log line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_panic_is_reported_not_fatal() {
+        let app = tauri::test::mock_app();
+        app.manage(VpnState::default());
+        let h = app.handle().clone();
+        let conn = Arc::new(Conn {
+            status: Mutex::new(Status { id: "pn".into(), state: "connecting".into(), ..Default::default() }),
+            input: Mutex::new(None), log: Mutex::new(VecDeque::new()), ctl: Mutex::new(None), stopping: Default::default(),
+            auth: Default::default(),
+        });
+        h.state::<VpnState>().conns.lock().unwrap().insert("pn".into(), conn.clone());
+        guarded(h.clone(), "pn".into(), conn, || panic!("boom"));
+        for _ in 0..40 {
+            if vpn_list(h.state()).await.unwrap().is_empty() { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(vpn_list(h.state()).await.unwrap().is_empty());
+        let log = vpn_log(h.state(), "pn".into()).await.unwrap();
+        assert!(log.iter().any(|l| l.contains("İç hata: boom")), "{log:?}");
     }
 
     #[test]

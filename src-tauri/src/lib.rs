@@ -62,6 +62,41 @@ fn set_window_effect(window: tauri::WebviewWindow, enabled: bool, level: Option<
     Ok(())
 }
 
+static CRASH_LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Record panics (thread, message, location) so a crash can be reported after restart.
+fn install_panic_hook(app: &tauri::App) {
+    use tauri::Manager;
+    if let Ok(dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = CRASH_LOG.set(dir.join("crash.log"));
+    }
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = CRASH_LOG.get() {
+            use std::io::Write;
+            let thread = std::thread::current().name().unwrap_or("?").to_string();
+            let msg = info.payload().downcast_ref::<String>().cloned()
+                .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "v{} [{thread}] {msg} @ {loc}", env!("CARGO_PKG_VERSION"));
+            }
+        }
+        default(info);
+    }));
+}
+
+/// Panics recorded since the last call (shown once at startup, then cleared).
+#[tauri::command]
+fn take_crash_log() -> Option<String> {
+    let path = CRASH_LOG.get()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    (!text.trim().is_empty()).then_some(text)
+}
+
 #[tauri::command]
 fn platform() -> &'static str {
     std::env::consts::OS
@@ -91,6 +126,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            install_panic_hook(app);
             migrate_config(app);
             Ok(())
         })
@@ -100,6 +136,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_window_effect,
             platform,
+            take_crash_log,
             vpn::vpn_connect,
             vpn::vpn_input,
             vpn::vpn_disconnect,
