@@ -99,11 +99,16 @@ struct Conn {
     log: Mutex<VecDeque<String>>,
     ctl: Mutex<Option<Ctl>>,
     stopping: std::sync::atomic::AtomicBool,
+    /// `openconnect --authenticate` results (COOKIE, CONNECT_URL, FINGERPRINT, RESOLVE).
+    /// Secret — never logged, never written to disk.
+    auth: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Default)]
 pub struct VpnState {
     conns: Mutex<HashMap<String, Arc<Conn>>>,
+    /// Log of the last finished connection per profile (so a failure can still be read).
+    last_logs: Mutex<HashMap<String, Vec<String>>>,
 }
 
 fn now_ms() -> u64 {
@@ -235,6 +240,10 @@ fn pump<R: Runtime>(app: AppHandle<R>, c: Arc<Conn>, parser: Arc<Mutex<Box<dyn P
             if line.is_empty() {
                 continue;
             }
+            if let Some((k, v)) = auth_var(&line) {
+                c.auth.lock().unwrap().insert(k, v);
+                continue; // contains the session cookie: never log
+            }
             if !line.starts_with("RX: ") {
                 push_log(&c, &line);
             }
@@ -250,6 +259,17 @@ fn pump<R: Runtime>(app: AppHandle<R>, c: Arc<Conn>, parser: Arc<Mutex<Box<dyn P
             }
         }
     }
+}
+
+/// `COOKIE='…'` style lines printed by `openconnect --authenticate` (shell-quoted).
+fn auth_var(line: &str) -> Option<(String, String)> {
+    let (k, v) = line.split_once('=')?;
+    if !matches!(k, "COOKIE" | "HOST" | "CONNECT_URL" | "FINGERPRINT" | "RESOLVE") {
+        return None;
+    }
+    let v = v.trim();
+    let v = if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') { v[1..v.len() - 1].replace("'\\''", "'") } else { v.to_string() };
+    Some((k.to_string(), v))
 }
 
 fn stop(c: &Conn) {
@@ -298,7 +318,12 @@ fn finish<R: Runtime>(app: &AppHandle<R>, id: &str, c: &Arc<Conn>) {
     }
     emit_status(app, c);
     if let Some(st) = app.try_state::<VpnState>() {
-        st.conns.lock().unwrap().remove(id);
+        // A retry may already have replaced this entry with a newer connection.
+        st.last_logs.lock().unwrap().insert(id.to_string(), c.log.lock().unwrap().iter().cloned().collect());
+        let mut conns = st.conns.lock().unwrap();
+        if conns.get(id).map(|x| Arc::ptr_eq(x, c)).unwrap_or(false) {
+            conns.remove(id);
+        }
     }
 }
 
@@ -338,6 +363,7 @@ pub async fn vpn_connect<R: Runtime>(app: AppHandle<R>, state: State<'_, VpnStat
         log: Mutex::new(VecDeque::new()),
         ctl: Mutex::new(None),
         stopping: Default::default(),
+        auth: Default::default(),
     });
     state.conns.lock().unwrap().insert(req.id.clone(), conn.clone());
     emit_status(&app, &conn);
@@ -398,6 +424,45 @@ fn start_child<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser
         finish(&a, &id, &c);
     });
     Ok(())
+}
+
+/// Phase 1 of a privileged connection: `openconnect --authenticate` as the normal user,
+/// with ordinary pipes, so every prompt (password, MFA, gateway, certificate) works the
+/// same as in app mode. Returns COOKIE/CONNECT_URL/FINGERPRINT/RESOLVE, or None (the
+/// parser has already reported why).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn authenticate(conn: &Arc<Conn>, app: &AppHandle<impl Runtime>, parser: &Arc<Mutex<Box<dyn Parser>>>, l: &Launch) -> Option<HashMap<String, String>> {
+    let mut args: Vec<String> = l.args.iter().filter(|a| !a.starts_with("--script")).cloned().collect();
+    args.insert(0, "--authenticate".into());
+    let mut cmd = std::process::Command::new(&l.program);
+    cmd.args(&args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            apply(app, conn, vec![Action::Fail { kind: "component", message: format!("{}: {e}", l.program.display()), pin: None }]);
+            return None;
+        }
+    };
+    *conn.input.lock().unwrap() = child.stdin.take().map(|w| Box::new(w) as Box<dyn Write + Send>);
+    *conn.ctl.lock().unwrap() = Some(Ctl::Child(child.id()));
+    let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let t1 = { let (a, c, p) = (app.clone(), conn.clone(), parser.clone()); std::thread::spawn(move || pump(a, c, p, out)) };
+    let t2 = { let (a, c, p) = (app.clone(), conn.clone(), parser.clone()); std::thread::spawn(move || pump(a, c, p, err)) };
+    let status = child.wait();
+    let _ = (t1.join(), t2.join());
+    *conn.input.lock().unwrap() = None;
+    let vars = std::mem::take(&mut *conn.auth.lock().unwrap());
+    let ok = status.map(|s| s.success()).unwrap_or(false) && vars.contains_key("COOKIE");
+    if ok { Some(vars) } else { None }
 }
 
 /// Global mode on macOS/Linux: run openconnect as root via the OS password prompt.
@@ -601,6 +666,7 @@ pub fn vpn_adopt<R: Runtime>(app: AppHandle<R>, state: State<'_, VpnState>) -> V
                 }),
                 ctl: Mutex::new(Some(Ctl::Root { ctrl: files.ctrl.clone() })),
                 stopping: Default::default(),
+                auth: Default::default(),
             });
             state.conns.lock().unwrap().insert(id.clone(), conn.clone());
             out.push(conn.status.lock().unwrap().clone());
@@ -631,100 +697,144 @@ impl NonBlock for std::fs::OpenOptions {
     }
 }
 
-/// `Write` that forwards bytes to the named-pipe writer task.
-#[cfg(windows)]
-struct ChanWriter(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
-#[cfg(windows)]
-impl Write for ChanWriter {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.send(b.to_vec()).map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Global mode on Windows: openconnect (+ Wintun) started elevated through UAC.
-/// stdin is a named pipe served by us (secrets never touch disk); output goes to log files
-/// we tail; deleting the control file makes the elevated watcher stop openconnect.
+/// Global mode on Windows, in two phases:
+/// 1. `openconnect --authenticate` unprivileged (normal pipes: prompts, MFA, certificate).
+/// 2. An elevated PowerShell (UAC) reads only the session cookie from our named pipe and
+///    starts openconnect with .NET's own stdin/stdout pipes (Wintun tunnel). Output is
+///    copied unbuffered to log files we tail; deleting the control file stops it.
+///    Neither the password nor the cookie is written to disk.
 #[cfg(windows)]
 fn start_elevated_windows<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Conn>, parser: Arc<Mutex<Box<dyn Parser>>>, l: Launch) -> Result<(), String> {
+    let (a, c, id, p) = (app.clone(), conn, id.to_string(), parser);
+    std::thread::spawn(move || {
+        let Some(vars) = authenticate(&c, &a, &p, &l) else {
+            finish(&a, &id, &c);
+            return;
+        };
+        if c.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            finish(&a, &id, &c);
+            return;
+        }
+        push_log(&c, "Kimlik doğrulandı; tünel yönetici izniyle başlatılıyor (UAC)…");
+        if let Err(e) = tunnel_windows(&a, &id, &c, &p, &l, vars) {
+            {
+                let mut s = c.status.lock().unwrap();
+                s.state = "error".into();
+                s.error = Some(e);
+                s.error_kind = Some("denied".into());
+            }
+            finish(&a, &id, &c);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn tunnel_windows<R: Runtime>(a: &AppHandle<R>, id: &str, c: &Arc<Conn>, p: &Arc<Mutex<Box<dyn Parser>>>, l: &Launch, vars: HashMap<String, String>) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::windows::named_pipe::ServerOptions;
+
     let tag = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("tp-vpn-{tag}"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let pipe = format!(r"\\.\pipe\tp-vpn-{tag}");
+    let pipe_name = format!("tp-vpn-{tag}");
     let (out_log, err_log, pid_file, ctrl, script) =
         (dir.join("out.log"), dir.join("err.log"), dir.join("pid"), dir.join("run"), dir.join("start.ps1"));
     std::fs::write(&ctrl, b"").map_err(|e| e.to_string())?;
     let iface = "TerminalPlus";
 
-    // Named pipe server → openconnect stdin.
-    let server = ServerOptions::new().first_pipe_instance(true).create(&pipe).map_err(|e| e.to_string())?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    *conn.input.lock().unwrap() = Some(Box::new(ChanWriter(tx)));
+    // Hand the cookie to the elevated wrapper once it connects, then close the pipe.
+    let cookie = vars.get("COOKIE").cloned().unwrap_or_default();
+    let server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(format!(r"\\.\pipe\{pipe_name}"))
+        .map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn(async move {
         let mut server = server;
-        if server.connect().await.is_err() {
-            return;
-        }
-        while let Some(b) = rx.recv().await {
-            if server.write_all(&b).await.is_err() {
-                break;
-            }
+        let connected = tokio::time::timeout(Duration::from_secs(120), server.connect()).await;
+        if matches!(connected, Ok(Ok(()))) {
+            let _ = server.write_all(format!("{cookie}\n").as_bytes()).await;
             let _ = server.flush().await;
+            let _ = server.disconnect();
         }
     });
 
-    let q = |s: &str| s.replace('\'', "''");
-    // Windows command-line quoting for openconnect's arguments.
+    // Tunnel arguments: protocol + script from the profile, the rest from --authenticate.
     let winarg = |a: &str| if a.contains([' ', '"']) { format!("\"{}\"", a.replace('"', "\\\"")) } else { a.to_string() };
-    let mut args: Vec<String> = vec![format!("--interface={iface}")];
-    args.extend(l.args.iter().map(|a| winarg(a)));
+    let mut args: Vec<String> = vec![format!("--interface={iface}"), "--cookie-on-stdin".into()];
+    args.extend(l.args.iter().filter(|a| a.starts_with("--protocol=") || a.starts_with("--script=")).cloned());
+    if let Some(f) = vars.get("FINGERPRINT").filter(|f| !f.is_empty()) {
+        args.push(format!("--servercert={f}"));
+    }
+    if let Some(r) = vars.get("RESOLVE").filter(|r| !r.is_empty()) {
+        args.push(format!("--resolve={r}"));
+    }
+    args.push("--reconnect-timeout=60".into());
+    let target = vars.get("CONNECT_URL").or(vars.get("HOST")).cloned().unwrap_or_else(|| l.args.last().cloned().unwrap_or_default());
+    args.push(target);
+    let arg_line = args.iter().map(|x| winarg(x)).collect::<Vec<_>>().join(" ");
+
+    let q = |s: &str| s.replace('\'', "''");
     let ps = format!(
-        "$ErrorActionPreference='Stop'\n$env:LC_ALL='C'\n\
-         $p = Start-Process -FilePath '{prog}' -ArgumentList '{args}' -RedirectStandardInput '{pipe}' \
-         -RedirectStandardOutput '{out}' -RedirectStandardError '{err}' -WindowStyle Hidden -PassThru\n\
-         Set-Content -Path '{pid}' -Value $p.Id\n\
-         while ((Test-Path '{ctrl}') -and -not $p.HasExited) {{ Start-Sleep -Milliseconds 700 }}\n\
-         if (-not $p.HasExited) {{ Stop-Process -Id $p.Id -Force }}\n",
+        r#"$ErrorActionPreference = 'Stop'
+$pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', '{pipe}', [System.IO.Pipes.PipeDirection]::In)
+$pipe.Connect(60000)
+$reader = New-Object System.IO.StreamReader($pipe)
+$cookie = $reader.ReadLine()
+$reader.Dispose()
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = '{prog}'
+$psi.Arguments = '{args}'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.EnvironmentVariables['LC_ALL'] = 'C'
+$proc = [System.Diagnostics.Process]::Start($psi)
+Set-Content -Path '{pid}' -Value $proc.Id
+$out = New-Object System.IO.FileStream('{out}', 'Append', 'Write', 'ReadWrite', 1)
+$err = New-Object System.IO.FileStream('{err}', 'Append', 'Write', 'ReadWrite', 1)
+$t1 = $proc.StandardOutput.BaseStream.CopyToAsync($out)
+$t2 = $proc.StandardError.BaseStream.CopyToAsync($err)
+$proc.StandardInput.WriteLine($cookie)
+$proc.StandardInput.Flush()
+$proc.StandardInput.Close()
+$cookie = $null
+while ((Test-Path '{ctrl}') -and -not $proc.HasExited) {{ Start-Sleep -Milliseconds 700 }}
+if (-not $proc.HasExited) {{ $proc.Kill() }}
+Start-Sleep -Milliseconds 500
+$out.Dispose(); $err.Dispose()
+"#,
+        pipe = pipe_name,
         prog = q(&l.program.to_string_lossy()),
-        args = q(&args.join(" ")),
-        pipe = q(&pipe),
+        args = q(&arg_line),
+        pid = q(&pid_file.to_string_lossy()),
         out = q(&out_log.to_string_lossy()),
         err = q(&err_log.to_string_lossy()),
-        pid = q(&pid_file.to_string_lossy()),
         ctrl = q(&ctrl.to_string_lossy()),
     );
     std::fs::write(&script, ps).map_err(|e| e.to_string())?;
-    *conn.ctl.lock().unwrap() = Some(Ctl::Root { ctrl: ctrl.clone() });
+    *c.ctl.lock().unwrap() = Some(Ctl::Root { ctrl: ctrl.clone() });
 
-    let (a, c, id, p) = (app.clone(), conn.clone(), id.to_string(), parser);
+    let launcher = format!(
+        "try {{ Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}' }} catch {{ exit 1 }}",
+        q(&script.to_string_lossy())
+    );
+    let ok = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &launcher])
+        .creation_flags(0x0800_0000)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("Yönetici izni (UAC) verilmedi".into());
+    }
+
+    let (a, c, id, p) = (a.clone(), c.clone(), id.to_string(), p.clone());
     std::thread::spawn(move || {
-        use std::os::windows::process::CommandExt;
-        let launcher = format!(
-            "try {{ Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}' }} catch {{ exit 1 }}",
-            q(&script.to_string_lossy())
-        );
-        let ok = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &launcher])
-            .creation_flags(0x0800_0000)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            {
-                let mut s = c.status.lock().unwrap();
-                s.state = "error".into();
-                s.error = Some("Yönetici izni (UAC) verilmedi".into());
-                s.error_kind = Some("denied".into());
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-            finish(&a, &id, &c);
-            return;
-        }
         let mut pos = [0u64; 2];
         let mut pending = [String::new(), String::new()];
         let mut seen_pid: Option<u32> = None;
@@ -736,10 +846,10 @@ fn start_elevated_windows<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Co
                 if let Ok(mut fh) = std::fs::File::open(f) {
                     use std::io::Seek;
                     let _ = fh.seek(std::io::SeekFrom::Start(pos[k]));
-                    let mut chunk = String::new();
-                    if let Ok(n) = fh.read_to_string(&mut chunk) {
+                    let mut buf = Vec::new();
+                    if let Ok(n) = fh.read_to_end(&mut buf) {
                         pos[k] += n as u64;
-                        pending[k].push_str(&chunk);
+                        pending[k].push_str(&String::from_utf8_lossy(&buf));
                     }
                 }
                 while let Some(i) = pending[k].find('\n') {
@@ -750,34 +860,32 @@ fn start_elevated_windows<R: Runtime>(app: &AppHandle<R>, id: &str, conn: Arc<Co
                     let acts = p.lock().unwrap().line(&line);
                     apply(&a, &c, acts);
                 }
-                if !pending[k].trim().is_empty() {
-                    let acts = p.lock().unwrap().prompt(&pending[k]);
-                    if !acts.is_empty() {
-                        pending[k].clear();
-                        apply(&a, &c, acts);
-                    }
-                }
             }
             if seen_pid.is_none() {
                 seen_pid = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse().ok());
             }
-            if ticks % 8 == 0 && c.status.lock().unwrap().state == "connected" {
-                if let Some((rx, tx)) = win_iface_bytes(iface) {
-                    let mut s = c.status.lock().unwrap();
-                    s.rx = rx;
-                    s.tx = tx;
+            if ticks % 8 == 0 {
+                let connected = c.status.lock().unwrap().state == "connected";
+                if connected {
+                    if let Some((rx, tx)) = win_iface_bytes(iface) {
+                        let mut s = c.status.lock().unwrap();
+                        s.rx = rx;
+                        s.tx = tx;
+                    }
                 }
             }
+            let stopping = c.stopping.load(std::sync::atomic::Ordering::Relaxed);
             let alive = match seen_pid {
                 Some(pid) => win_pid_alive(pid),
-                None => ticks < 480 && !c.stopping.load(std::sync::atomic::Ordering::Relaxed),
+                // Waiting for UAC + process start; give up after 2 minutes.
+                None => ticks < 480 && !stopping,
             };
             if !alive {
                 break;
             }
         }
         let _ = std::fs::remove_file(&ctrl);
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(800));
         let _ = std::fs::remove_dir_all(&dir);
         finish(&a, &id, &c);
     });
@@ -897,7 +1005,10 @@ pub async fn vpn_list(state: State<'_, VpnState>) -> Result<Vec<Status>, String>
 #[tauri::command]
 pub async fn vpn_log(state: State<'_, VpnState>, id: String) -> Result<Vec<String>, String> {
     let c = state.conns.lock().unwrap().get(&id).cloned();
-    Ok(c.map(|c| c.log.lock().unwrap().iter().cloned().collect()).unwrap_or_default())
+    Ok(match c {
+        Some(c) => c.log.lock().unwrap().iter().cloned().collect(),
+        None => state.last_logs.lock().unwrap().get(&id).cloned().unwrap_or_default(),
+    })
 }
 
 /// Is the SOCKS proxy of an app-mode connection up? Used before SSH dials through it.
@@ -1023,6 +1134,7 @@ echo 'Configured as 10.9.9.9, with SSL connected'\ntrap 'exit 0' INT TERM\nwhile
         let conn = Arc::new(Conn {
             status: Mutex::new(Status { id: "dl".into(), name: "fake".into(), state: "connecting".into(), mode: "global".into(), ..Default::default() }),
             input: Mutex::new(None), log: Mutex::new(VecDeque::new()), ctl: Mutex::new(None), stopping: Default::default(),
+            auth: Default::default(),
         });
         h.state::<VpnState>().conns.lock().unwrap().insert("dl".into(), conn.clone());
         let parser: Arc<Mutex<Box<dyn Parser>>> = Arc::new(Mutex::new(Box::new(openconnect::OcParser::new(&req))));
@@ -1045,6 +1157,68 @@ echo 'Configured as 10.9.9.9, with SSL connected'\ntrap 'exit 0' INT TERM\nwhile
         }
         assert!(vpn_list(h.state()).await.unwrap().is_empty(), "not cleaned up after disconnect");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two-phase flow used for Windows global mode: `--authenticate` (password via a normal
+    /// pipe) → session cookie → second openconnect with --cookie-on-stdin builds the tunnel.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn authenticate_then_cookie_tunnel() {
+        let spec = std::env::var("TP_TEST_VPN").expect("TP_TEST_VPN");
+        let p: Vec<&str> = spec.split('|').collect();
+        let app = tauri::test::mock_app();
+        app.manage(VpnState::default());
+        let h = app.handle().clone();
+        let req: ConnectReq = serde_json::from_value(serde_json::json!({
+            "id": "a1", "name": "t", "protocol": "openconnect", "ocProtocol": "anyconnect",
+            "server": p[0], "user": p[1], "password": p[2], "servercert": p[3], "mode": "global"
+        })).unwrap();
+        let launch = openconnect::launch(&h, &req, None).unwrap();
+        let conn = Arc::new(Conn {
+            status: Mutex::new(Status { id: "a1".into(), state: "connecting".into(), ..Default::default() }),
+            input: Mutex::new(None), log: Mutex::new(VecDeque::new()), ctl: Mutex::new(None), stopping: Default::default(),
+            auth: Default::default(),
+        });
+        let parser: Arc<Mutex<Box<dyn Parser>>> = Arc::new(Mutex::new(Box::new(openconnect::OcParser::new(&req))));
+        let (h2, c2, p2) = (h.clone(), conn.clone(), parser.clone());
+        let vars = tokio::task::spawn_blocking(move || authenticate(&c2, &h2, &p2, &launch)).await.unwrap()
+            .unwrap_or_else(|| panic!("authenticate failed: {:?}", conn.log.lock().unwrap()));
+        assert!(!vars["COOKIE"].is_empty());
+        assert!(vars["FINGERPRINT"].starts_with("pin-sha256:") || vars["FINGERPRINT"].len() >= 40, "{:?}", vars.get("FINGERPRINT"));
+        assert!(conn.log.lock().unwrap().iter().all(|l| !l.contains(&vars["COOKIE"])), "cookie leaked into the log");
+
+        // Phase 2 equivalent: tunnel from the cookie alone (app mode so no root is needed).
+        let port = free_port().unwrap();
+        let ocproxy = components::find(&h, "openconnect", "ocproxy").unwrap();
+        let target = vars.get("CONNECT_URL").or(vars.get("HOST")).unwrap().clone();
+        let mut child = std::process::Command::new(components::find(&h, "openconnect", "openconnect").unwrap())
+            .args(["--protocol=anyconnect", "--cookie-on-stdin", &format!("--servercert={}", vars["FINGERPRINT"]),
+                   "--script-tun", &format!("--script={} -D {port}", ocproxy.display()), &target])
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(format!("{}\n", vars["COOKIE"]).as_bytes()).unwrap();
+        assert!(wait_port(port, Duration::from_secs(15)), "tunnel from cookie never came up");
+        let (host, tport) = p[4].split_once(':').unwrap();
+        let mut s = None;
+        for _ in 0..20 {
+            if let Ok(x) = crate::socks::connect(&format!("127.0.0.1:{port}"), host, tport.parse().unwrap()).await { s = Some(x); break; }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let mut banner = [0u8; 8];
+        tokio::io::AsyncReadExt::read_exact(s.as_mut().expect("socks"), &mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-");
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+        let _ = child.wait();
+        let _ = std::process::Command::new("pkill").args(["-f", &format!("ocproxy -D {port}")]).status();
+    }
+
+    #[test]
+    fn auth_vars_are_unquoted() {
+        assert_eq!(auth_var("COOKIE='a'\\''b'"), Some(("COOKIE".into(), "a'b".into())));
+        assert_eq!(auth_var("CONNECT_URL='https://h:443/x'").unwrap().1, "https://h:443/x");
+        assert_eq!(auth_var("FOO=bar"), None);
     }
 
     /// Global-mode plumbing without root: FIFO password, log tail, failure + cleanup.

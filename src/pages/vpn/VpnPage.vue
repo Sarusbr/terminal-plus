@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import Icon from "../../components/Icon.vue";
 import { confirm, toast } from "../../stores/ui";
 import { fmtBytes } from "../../stores/transfers";
@@ -71,6 +72,13 @@ async function showDetails(p: VpnProfile) {
 }
 async function reveal(p: VpnProfile) {
   revealed.value = revealed.value === null ? (await invoke<string | null>("vpn_secret_reveal", { id: p.id })) ?? "" : null;
+}
+async function copyLog(p: VpnProfile) {
+  const lines = await invoke<string[]>("vpn_log", { id: p.id }).catch(() => []);
+  const s = st(p.id);
+  const head = [`${p.name} · ${protoName(p)} · ${p.server}`, s?.error ? `Hata: ${s.error}` : ""].filter(Boolean);
+  await writeText([...head, "", ...(lines.length ? lines : logLines.value)].join("\n"));
+  toast("Log panoya kopyalandı");
 }
 async function showLog(id: string) {
   logFor.value = logFor.value === id ? null : id;
@@ -187,8 +195,11 @@ onBeforeUnmount(() => clearInterval(tick));
         </div>
 
         <div v-if="st(p.id)?.state === 'error' && st(p.id)?.error" class="err">
-          <Icon name="alert" :size="13" /> {{ st(p.id)?.error }}
+          <Icon name="alert" :size="13" />
+          <span class="errtext">{{ st(p.id)?.error }}</span>
           <button v-if="st(p.id)?.errorKind === 'auth'" class="link" @click="edit(p)">bilgileri düzenle</button>
+          <button class="link" @click="showLog(p.id)">log</button>
+          <button class="link" @click="copyLog(p)">logu kopyala</button>
         </div>
 
         <div v-if="live(p.id)" class="stats">
@@ -203,7 +214,10 @@ onBeforeUnmount(() => clearInterval(tick));
           <span class="grow" />
           <button class="ib" :class="{ on: logFor === p.id }" data-tip="Log" @click="showLog(p.id)"><Icon name="scroll" :size="14" /></button>
         </div>
-        <pre v-if="logFor === p.id" class="log">{{ logLines.slice(-60).join('\n') }}</pre>
+        <div v-if="logFor === p.id" class="logwrap">
+          <button class="ib copy" data-tip="Logu kopyala" @click="copyLog(p)"><Icon name="copy" :size="13" /></button>
+          <pre class="log">{{ logLines.join('\n') || '—' }}</pre>
+        </div>
 
         <div v-if="details === p.id" class="kv">
           <div><span>Protokol</span><b>{{ protoName(p) }}</b></div>
@@ -251,7 +265,10 @@ onBeforeUnmount(() => clearInterval(tick));
 .btn.danger-o { color: var(--danger); }
 .acts { display: flex; gap: 0; margin-left: 4px; opacity: .55; }
 .card:hover .acts { opacity: 1; }
-.err { font-size: 12px; color: var(--danger); display: flex; gap: 6px; align-items: center; }
+.err { font-size: 12px; color: var(--danger); display: flex; gap: 6px; align-items: flex-start; flex-wrap: wrap; }
+.errtext { flex: 1 1 260px; min-width: 0; word-break: break-word; white-space: pre-wrap; user-select: text; -webkit-user-select: text; font-family: var(--font-mono); font-size: 11.5px; }
+.logwrap { position: relative; }
+.logwrap .copy { position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; background: rgb(var(--bg-rgb) / 0.8); }
 .link { color: var(--accent); font-size: 11.5px; margin-left: 6px; }
 .stats { display: flex; align-items: center; gap: 16px; font-size: 12px; font-family: var(--font-mono); color: var(--fg); padding-left: 18px; }
 .stats span { display: inline-flex; align-items: center; gap: 4px; }
