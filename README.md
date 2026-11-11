@@ -82,6 +82,20 @@ on first panel use (never on connect); it removes itself from history.
 Panels are disabled while a full-screen program (vim, htop, less …) is running, and for
 local tabs also while any foreground program runs.
 
+## VPN
+
+Sol bardaki **VPN** sayfasından profil eklenir (OpenConnect: GlobalProtect, AnyConnect,
+Fortinet, Pulse/Ivanti, F5, Array). Şifreler OS keychain'de tutulur.
+
+- **Uygulama için bağlan** (macOS/Linux): yalnızca Terminal Plus trafiği VPN'den geçer
+  (ocproxy SOCKS5), yönetici izni gerekmez. Profili bağlı sunuculara SSH/SFTP bu proxy
+  üzerinden açılır.
+- **Genel bağlan**: sistem genelinde tun; macOS'ta her bağlantıda yönetici şifresi,
+  Windows'ta UAC onayı, Linux'ta pkexec.
+- Bileşenler kurulumla gelmez; ilk kullanımda bu reponun `vpn-components` release'inden
+  indirilir (sha256 doğrulamalı). Sistemde kurulu openconnect de kullanılabilir.
+- Bileşenleri yeniden derlemek: Actions → **VPN components** → *Run workflow*.
+
 ## Layout
 
 | Path | What |
@@ -92,6 +106,8 @@ local tabs also while any foreground program runs.
 | `src-tauri/src/fsops.rs` | Editor file read/write |
 | `src-tauri/src/secrets.rs` | OS keychain |
 | `src/lib/runner.ts`, `src/lib/shell.ts` | Panel command service |
+| `src-tauri/src/vpn/` | VPN providers (OpenConnect), components, global/app modes |
+| `src-tauri/src/socks.rs` | SOCKS5 client for SSH over app-mode VPN |
 | `src/pages/registry.ts` | Page modules — add a page here |
 
 ## Known limits

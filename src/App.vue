@@ -13,6 +13,7 @@ import { loadServers } from "./stores/servers";
 import { tabs, activeTab, paneHandles, splitPane, closePane, initTabEvents, openLocal } from "./stores/tabs";
 import { ui, toast } from "./stores/ui";
 import TransferDialog from "./components/TransferDialog.vue";
+import { initVpnEvents, loadVpn } from "./stores/vpn";
 import { initTransferEvents, startTransfer, filesCwd } from "./stores/transfers";
 import { sh } from "./lib/shell";
 import { isWinLocal, cwdOf } from "./lib/winlocal";
@@ -22,7 +23,7 @@ const ready = ref(false);
 const page = computed(() => pages.find((p) => p.id === ui.page));
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), loadServers(), initTabEvents(), initTransferEvents()]);
+  await Promise.all([loadSettings(), loadServers(), initTabEvents(), initTransferEvents(), initVpnEvents(), loadVpn()]);
   initDrop();
   ready.value = true;
   openLocal(); // start with a local shell, like any terminal app

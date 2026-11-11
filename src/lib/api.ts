@@ -12,6 +12,7 @@ export interface ConnectArgs {
   passphrase?: string;
   serverId?: string;
   saveSecret?: boolean;
+  proxy?: string;
 }
 
 export type ShellKind = "cmd" | "powershell" | "posix";
@@ -83,8 +84,8 @@ export const api = {
   secretExists: (kind: "pw" | "pp", serverId: string) =>
     invoke<boolean>("secret_exists", { kind, serverId }),
 
-  storeLoad: <T>(name: "servers" | "settings") => invoke<T | null>("store_load", { name }),
-  storeSave: (name: "servers" | "settings", data: unknown) => invoke<void>("store_save", { name, data }),
+  storeLoad: <T>(name: "servers" | "settings" | "vpn") => invoke<T | null>("store_load", { name }),
+  storeSave: (name: "servers" | "settings" | "vpn", data: unknown) => invoke<void>("store_save", { name, data }),
   sshConfigImport: () => invoke<SshConfigHost[]>("ssh_config_import"),
 };
 

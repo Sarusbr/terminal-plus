@@ -3,6 +3,8 @@ import { ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { tabs, tabLabel, closeTab, moveTab, paneHandles, openLocal, localShells, loadLocalShells } from "../stores/tabs";
 import { settings } from "../stores/settings";
+import { vpn, activeConnections } from "../stores/vpn";
+import { computed } from "vue";
 import { ui } from "../stores/ui";
 import Icon from "./Icon.vue";
 
@@ -19,6 +21,10 @@ function pick(id: string) {
   menu.value = false;
   openLocal(id);
 }
+const vpnActive = computed(() => {
+  void vpn.status;
+  return activeConnections()[0];
+});
 const isDefault = (id: string) => (settings.localShell || localShells.list[0]?.id) === id;
 const toggleMax = () => getCurrentWindow().toggleMaximize().catch(() => {});
 const dragging = ref("");
@@ -74,6 +80,14 @@ function down(e: PointerEvent, id: string) {
       </div>
       <div class="drag" data-tauri-drag-region @dblclick="toggleMax" />
     </div>
+    <button
+      v-if="vpnActive" class="vpn-ind" :class="vpnActive.state"
+      :data-tip="`VPN: ${vpnActive.name} (${vpnActive.mode === 'app' ? 'uygulama' : 'genel'})${activeConnections().length > 1 ? ' +' + (activeConnections().length - 1) : ''}`"
+      data-tip-pos="bottom" @click="ui.page = 'vpn'"
+    >
+      <Icon :name="vpnActive.mode === 'app' ? 'terminal' : 'globe'" :size="12" />
+      <span>{{ vpnActive.name }}</span>
+    </button>
     <div class="plus">
       <button class="ib add" :class="{ on: menu }" :data-tip="menu ? undefined : 'Yerel terminal'" data-tip-pos="bottom" @click="plus">
         <Icon name="plus" :size="15" />
@@ -124,6 +138,13 @@ function down(e: PointerEvent, id: string) {
 .add { width: var(--header-h); height: 100%; border-radius: 0; flex: none; }
 .add.on { color: var(--fg); background: rgb(var(--fg-rgb) / 0.07); }
 .plus { position: relative; display: flex; }
+.vpn-ind {
+  flex: none; display: flex; align-items: center; gap: 5px; max-width: 160px; padding: 0 10px;
+  font-size: 11.5px; color: var(--ok); border-left: 1px solid var(--line);
+}
+.vpn-ind span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vpn-ind.connecting, .vpn-ind.reconnecting { color: var(--warn); }
+.vpn-ind:hover { background: rgb(var(--fg-rgb) / 0.05); }
 .menu-backdrop { position: fixed; inset: 0; z-index: 60; }
 .menu {
   position: absolute; top: calc(100% + 4px); right: 4px; z-index: 61; min-width: 170px; padding: 4px;

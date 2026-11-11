@@ -3,6 +3,7 @@ import { reactive, computed } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { api, uid, type ShellKind } from "../lib/api";
 import { settings } from "./settings";
+import { proxyFor } from "./vpn";
 import type { Server } from "./servers";
 import { confirmHostKey, prompt, ui } from "./ui";
 import type { RunOpts, RunResult } from "../lib/runner";
@@ -122,8 +123,20 @@ export async function connect(tab: Tab, creds: { password?: string; passphrase?:
   tab.error = undefined;
   const s = tab.server;
   try {
+    // Linked VPN: bring it up first; app mode → SSH dials through its SOCKS proxy.
+    let proxy: string | undefined;
+    if (s.vpnId) {
+      try {
+        proxy = await proxyFor(s.vpnId);
+      } catch (e) {
+        if (tab.connId !== connId) return;
+        tab.status = "error";
+        tab.error = `VPN: ${String((e as Error)?.message ?? e)}`;
+        return;
+      }
+    }
     const r = await api.connect({
-      connId, host: s.host, port: s.port, user: s.user, auth: s.auth,
+      connId, host: s.host, port: s.port, user: s.user, auth: s.auth, proxy,
       keyPath: s.keyPath, serverId: s.id,
       password: creds.password, passphrase: creds.passphrase, saveSecret: creds.save,
     });

@@ -176,6 +176,8 @@ pub struct ConnectArgs {
     server_id: Option<String>,
     #[serde(default)]
     save_secret: bool,
+    /// "127.0.0.1:port" — dial through an app-mode VPN's SOCKS5 proxy.
+    proxy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -276,11 +278,22 @@ pub async fn ssh_connect<R: Runtime>(
     state: State<'_, SshState>,
     args: ConnectArgs,
 ) -> Result<ConnectResult, String> {
-    let addr = resolve(&args.host, args.port).await?;
-    let tcp = tokio::time::timeout(Duration::from_secs(12), tokio::net::TcpStream::connect(addr))
-        .await
-        .map_err(|_| format!("TIMEOUT: {addr}"))?
-        .map_err(|e| format!("TCP: {e}"))?;
+    let (tcp, ip) = match args.proxy.as_deref() {
+        Some(proxy) => {
+            let t = tokio::time::timeout(Duration::from_secs(20), crate::socks::connect(proxy, &args.host, args.port))
+                .await
+                .map_err(|_| format!("TIMEOUT: {} (VPN)", args.host))??;
+            (t, "VPN".to_string())
+        }
+        None => {
+            let addr = resolve(&args.host, args.port).await?;
+            let t = tokio::time::timeout(Duration::from_secs(12), tokio::net::TcpStream::connect(addr))
+                .await
+                .map_err(|_| format!("TIMEOUT: {addr}"))?
+                .map_err(|e| format!("TCP: {e}"))?;
+            (t, addr.ip().to_string())
+        }
+    };
     let _ = tcp.set_nodelay(true);
 
     let config = Arc::new(client::Config {
@@ -368,7 +381,7 @@ pub async fn ssh_connect<R: Runtime>(
         args.conn_id.clone(),
         Arc::new(Conn { handle, server_id: args.server_id.clone() }),
     );
-    Ok(ConnectResult { ip: addr.ip().to_string() })
+    Ok(ConnectResult { ip })
 }
 
 fn shellexpand_home(p: &str) -> String {
@@ -555,7 +568,7 @@ mod tests {
         ConnectArgs {
             conn_id: conn_id.into(), host: host.into(), port, user: user.into(),
             auth: "password".into(), password: Some(pw.into()), key_path: None,
-            passphrase: None, server_id: None, save_secret: false,
+            passphrase: None, server_id: None, save_secret: false, proxy: None,
         }
     }
 

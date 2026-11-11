@@ -97,6 +97,11 @@ const shortcuts: [string, string][] = [
     </section>
 
     <section>
+      <h4>VPN</h4>
+      <label class="row"><span>Uygulama kapanınca genel VPN açık kalsın</span><input v-model="settings.vpnKeepGlobal" type="checkbox" /></label>
+    </section>
+
+    <section>
       <h4>Kısayollar</h4>
       <div v-for="[k, d] in shortcuts" :key="k" class="row kb"><span>{{ d }}</span><kbd>{{ k }}</kbd></div>
     </section>

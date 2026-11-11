@@ -25,6 +25,10 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 window-vibrancy = "0.6"
 dirs = "6"
 portable-pty = "0.9"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 anyhow = "1"

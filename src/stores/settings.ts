@@ -18,6 +18,8 @@ export interface Settings {
   ligatures: boolean;
   /** Local shell id from `local_shells` ("" = first: CMD on Windows, $SHELL elsewhere). */
   localShell: string;
+  /** Leave a global VPN up when the app quits (read by the Rust side on exit). */
+  vpnKeepGlobal: boolean;
   /** Per-token overrides on top of the selected theme. */
   custom: { bg?: string; fg?: string; accent?: string; cursor?: string; selection?: string };
 }
@@ -36,6 +38,7 @@ const defaults: Settings = {
   blurLevel: "medium",
   ligatures: false,
   localShell: "",
+  vpnKeepGlobal: false,
   custom: {},
 };
 

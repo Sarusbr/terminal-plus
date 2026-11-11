@@ -11,6 +11,8 @@ export interface Server {
   keyPath?: string;
   group?: string;
   tags: string[];
+  /** Optional VPN profile opened (in its default mode) before connecting. */
+  vpnId?: string;
 }
 
 export const servers = reactive<{ list: Server[]; loaded: boolean }>({ list: [], loaded: false });

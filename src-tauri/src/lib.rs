@@ -2,7 +2,9 @@ mod fsops;
 mod local;
 mod secrets;
 mod ssh;
+mod socks;
 mod store;
+mod vpn;
 mod transfer;
 
 /// Toggle native blur behind the (transparent) window.
@@ -94,9 +96,22 @@ pub fn run() {
         })
         .manage(ssh::SshState::default())
         .manage(transfer::TransferState::default())
+        .manage(vpn::VpnState::default())
         .invoke_handler(tauri::generate_handler![
             set_window_effect,
             platform,
+            vpn::vpn_connect,
+            vpn::vpn_input,
+            vpn::vpn_disconnect,
+            vpn::vpn_list,
+            vpn::vpn_log,
+            vpn::vpn_socks_port,
+            vpn::vpn_secret_exists,
+            vpn::vpn_secret_reveal,
+            vpn::vpn_secret_set,
+            vpn::components::vpn_component_status,
+            vpn::components::vpn_component_install,
+            vpn::components::vpn_component_remove,
             transfer::transfer_start,
             transfer::transfer_cancel,
             fsops::file_read,
@@ -124,6 +139,24 @@ pub fn run() {
             store::store_save,
             store::ssh_config_import,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Terminal Plus");
+        .build(tauri::generate_context!())
+        .expect("error while building Terminal Plus")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                // Settings → "VPN: keep global connection when the app closes".
+                let keep = app
+                    .path()
+                    .app_config_dir()
+                    .ok()
+                    .and_then(|d| std::fs::read_to_string(d.join("settings.json")).ok())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("vpnKeepGlobal").and_then(|b| b.as_bool()))
+                    .unwrap_or(false);
+                if let Some(st) = app.try_state::<vpn::VpnState>() {
+                    vpn::shutdown(&st, keep);
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+        });
 }

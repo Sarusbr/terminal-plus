@@ -5,6 +5,7 @@ import { api } from "../lib/api";
 import { servers, newServer, upsertServer, removeServer, importSshConfig, type Server } from "../stores/servers";
 import { openServer } from "../stores/tabs";
 import { confirm, toast } from "../stores/ui";
+import { vpn } from "../stores/vpn";
 import Icon from "../components/Icon.vue";
 
 const q = ref("");
@@ -91,6 +92,12 @@ async function doImport() {
         <label class="port">Port<input v-model.number="editing.port" type="number" min="1" max="65535" /></label>
         <label>Kullanıcı<input v-model="editing.user" /></label>
         <label>Etiketler<input v-model="tagsText" placeholder="api, prod" /></label>
+        <label>VPN profili
+          <select v-model="editing.vpnId">
+            <option :value="undefined">— yok —</option>
+            <option v-for="p in vpn.profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+          </select>
+        </label>
       </div>
       <div class="auth">
         <div class="seg">
@@ -139,6 +146,7 @@ async function doImport() {
             <span class="name">{{ s.name }}</span>
             <span class="addr">{{ s.user }}@{{ s.host }}<template v-if="s.port !== 22">:{{ s.port }}</template></span>
           </div>
+          <span v-if="s.vpnId && vpn.profiles.some((p) => p.id === s.vpnId)" class="tag vpn" :data-tip="`VPN: ${vpn.profiles.find((p) => p.id === s.vpnId)?.name}`"><Icon name="vpn" :size="10" /></span>
           <span v-for="t in s.tags" :key="t" class="tag">{{ t }}</span>
           <div class="acts">
             <button class="ib" data-tip="Bağlan" @click="openServer(s)"><Icon name="link" /></button>
@@ -166,6 +174,7 @@ h4 { margin: 14px 8px 4px; font-size: 11px; font-weight: 500; color: var(--muted
 .info { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; }
 .name { white-space: nowrap; }
 .addr { font-family: var(--font-mono); font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag.vpn { color: var(--accent); display: inline-flex; padding: 2px 5px; }
 .tag { font-size: 10.5px; padding: 1px 6px; border-radius: 8px; color: var(--muted); border: 1px solid var(--line); }
 .acts { display: flex; gap: 2px; opacity: 0; transition: opacity .1s; }
 .srv:hover .acts, .srv:focus-within .acts { opacity: 1; }

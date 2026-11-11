@@ -25,6 +25,7 @@ export const pages: PageDef[] = [
   { id: "ports", icon: "ports", title: "Portlar", component: defineAsyncComponent(() => import("./ports/PortsPage.vue")), needsShell: true },
   { id: "logs", icon: "scroll", title: "Loglar", component: defineAsyncComponent(() => import("./logs/LogsPage.vue")), needsShell: true },
   { id: "services", icon: "services", title: "Servisler", component: defineAsyncComponent(() => import("./services/ServicesPage.vue")), needsShell: true },
+  { id: "vpn", windows: true, icon: "vpn", title: "VPN", component: defineAsyncComponent(() => import("./vpn/VpnPage.vue")) },
   { id: "servers", icon: "server", title: "Sunucular", component: defineAsyncComponent(() => import("./ServersPage.vue")) },
   { id: "settings", icon: "cog", title: "Ayarlar", component: defineAsyncComponent(() => import("./SettingsPage.vue")), bottom: true },
 ];

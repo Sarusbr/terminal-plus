@@ -20,14 +20,19 @@ watch(d, (cur) => {
 function ok() {
   const cur = d.value;
   if (!cur) return;
+  if (cur.kind === "choose") return;
   if (cur.kind === "prompt") closeDialog(cur, { value: value.value, remember: remember.value });
   else closeDialog(cur, true);
   value.value = "";
 }
+function pick(v: string) {
+  const cur = d.value;
+  if (cur?.kind === "choose") closeDialog(cur, v);
+}
 function cancel() {
   const cur = d.value;
   if (!cur) return;
-  closeDialog(cur, cur.kind === "prompt" ? null : false);
+  closeDialog(cur, cur.kind === "prompt" || cur.kind === "choose" ? null : false);
   value.value = "";
 }
 </script>
@@ -45,6 +50,14 @@ function cancel() {
         <label v-if="d.opts.remember" class="check">
           <input v-model="remember" type="checkbox" /> Keychain'e kaydet
         </label>
+      </template>
+
+      <template v-else-if="d.kind === 'choose'">
+        <div class="head"><Icon name="list" /> {{ d.opts.title }}</div>
+        <div v-if="d.opts.message" class="msg">{{ d.opts.message }}</div>
+        <div class="choices">
+          <button v-for="(o, i) in d.opts.options" :key="o" type="button" class="choice" :ref="(el) => { if (i === 0) okBtn = el as HTMLButtonElement }" @click="pick(o)">{{ o }}</button>
+        </div>
       </template>
 
       <template v-else-if="d.kind === 'confirm'">
@@ -67,6 +80,7 @@ function cancel() {
       <div class="actions">
         <button type="button" class="btn" @click="cancel">Vazgeç</button>
         <button
+          v-if="d.kind !== 'choose'"
           ref="okBtn" type="submit" class="btn primary"
           :class="{ danger: d.kind === 'confirm' && d.opts.danger }"
         >
@@ -89,7 +103,10 @@ function cancel() {
   animation: pop .12s ease-out;
 }
 .head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
-.msg { color: var(--fg); font-size: 12.5px; line-height: 1.5; }
+.msg { color: var(--fg); font-size: 12.5px; line-height: 1.5; white-space: pre-line; word-break: break-word; }
+.choices { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow: auto; }
+.choice { text-align: left; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line); font-family: var(--font-mono); font-size: 12.5px; }
+.choice:hover, .choice:focus { background: rgb(var(--fg-rgb) / 0.07); outline: none; border-color: var(--accent); }
 .msg.muted { color: var(--muted); }
 .fp { display: flex; flex-direction: column; gap: 4px; padding: 10px; border-radius: 6px; background: rgb(var(--fg-rgb) / 0.05); font-size: 12px; }
 .fp code { font-family: var(--font-mono); word-break: break-all; color: var(--accent); }

@@ -13,7 +13,7 @@ fn config_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
 }
 
 fn valid_name(name: &str) -> bool {
-    matches!(name, "servers" | "settings")
+    matches!(name, "servers" | "settings" | "vpn")
 }
 
 /// Load a JSON document ("servers" or "settings"). Returns null when absent.

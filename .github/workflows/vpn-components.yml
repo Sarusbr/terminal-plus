@@ -1,0 +1,100 @@
+name: VPN components
+
+# Manually run. Builds the optional VPN components the app downloads on first use and
+# publishes them (plus manifest.json with sha256/size) to the `vpn-components` release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Component bundle version label"
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+env:
+  TAG: vpn-components
+  WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
+  WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Build openconnect + ocproxy bundle (arm64)
+        run: |
+          brew install openconnect ocproxy dylibbundler
+          P=$(brew --prefix)
+          mkdir -p out/bin out/lib
+          cp -L "$P/bin/openconnect" "$P/bin/ocproxy" out/bin/
+          cp -L "$P/etc/vpnc/vpnc-script" out/vpnc-script
+          chmod 755 out/bin/* out/vpnc-script
+          dylibbundler -od -b -cd -x out/bin/openconnect -x out/bin/ocproxy -d out/lib -p @executable_path/../lib/
+          # Re-sign everything we touched (required on Apple Silicon).
+          for f in out/lib/*.dylib out/bin/*; do codesign --force --sign - "$f"; done
+          out/bin/openconnect --version
+          (cd out && zip -qry ../openconnect-macos-aarch64.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: openconnect-macos-aarch64.zip
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-openconnect zip unzip curl
+      - name: Bundle openconnect.exe + DLLs + Wintun + vpnc-script
+        run: |
+          mkdir -p out/bin
+          cp /mingw64/bin/openconnect.exe out/bin/
+          # Every DLL openconnect loads from mingw64 (ldd is recursive).
+          ldd /mingw64/bin/openconnect.exe | awk '/mingw64/ {print $3}' | sort -u | xargs -I{} cp {} out/bin/
+          curl -fsSL "$WINTUN_URL" -o wintun.zip
+          echo "$WINTUN_SHA256  wintun.zip" | sha256sum -c -
+          unzip -q wintun.zip
+          cp wintun/bin/amd64/wintun.dll out/bin/
+          curl -fsSL https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script-win.js -o out/vpnc-script-win.js
+          ./out/bin/openconnect.exe --version
+          (cd out && zip -qr ../openconnect-windows-x86_64.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: openconnect-windows-x86_64.zip
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Manifest + upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          entry() { f=$1; printf '"%s": {"url": "%s/%s", "sha256": "%s", "size": %s, "version": "%s"}' \
+            "$2" "$base" "$f" "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c %s "$f")" "$VERSION"; }
+          {
+            echo '{"components": {"openconnect": {'
+            entry openconnect-macos-aarch64.zip macos-aarch64; echo ','
+            entry openconnect-windows-x86_64.zip windows-x86_64
+            echo '}}}'
+          } > manifest.json
+          cat manifest.json
+          python3 -m json.tool manifest.json > /dev/null
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease --title "VPN components" \
+              --notes "Terminal Plus tarafından ilk kullanımda indirilen isteğe bağlı VPN bileşenleri. Elle indirmeye gerek yok."
+          gh release upload "$TAG" openconnect-*.zip manifest.json --clobber -R "$GITHUB_REPOSITORY"
