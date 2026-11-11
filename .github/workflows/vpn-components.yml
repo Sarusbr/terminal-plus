@@ -50,7 +50,7 @@ jobs:
       - name: Toolchain
         run: |
           dnf install -y --setopt=install_weak_deps=False git autoconf automake libtool gettext-devel pkgconf-pkg-config \
-            make zip unzip curl findutils mingw64-gcc mingw64-gnutls mingw64-libxml2 mingw64-zlib
+            make zip unzip curl jq findutils mingw64-gcc mingw64-gnutls mingw64-libxml2 mingw64-zlib
       - name: Build openconnect.exe
         run: |
           OC_TAG=$(git ls-remote --tags --refs https://gitlab.com/openconnect/openconnect.git 'v9.*' | sed 's|.*/||' | sort -V | tail -1)
