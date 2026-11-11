@@ -21,7 +21,8 @@ export interface VpnProfile {
   group?: string;
   certPath?: string;
   configPath?: string;
-  /** Server certificate pin the user accepted ("pin-sha256:…"). */
+  /** Server certificate pins the user trusted, comma-separated ("pin-sha256:…,pin-sha256:…").
+   *  GlobalProtect portal and gateway may each have their own certificate. */
   servercert?: string;
   defaultMode: VpnMode;
 }
@@ -170,7 +171,7 @@ async function onStatus(s: VpnStatus) {
       okText: "Güven ve bağlan",
     });
     if (!ok) return w.reject(new Error("Sertifika reddedildi"));
-    p.servercert = s.pin;
+    p.servercert = [...pinList(p), s.pin].filter((v, i, a) => a.indexOf(v) === i).join(",");
     await saveProfile(p);
     connect(p, w.mode).then(w.resolve, w.reject);
     return;
@@ -209,6 +210,8 @@ export async function initVpnEvents() {
   await listen<{ id: string; kind: string; message: string; options: string[] }>("vpn-prompt", (e) => onPrompt(e.payload));
   await listen<{ component: string; done: number; total: number }>("vpn-download", (e) => (vpn.download = e.payload));
 }
+
+export const pinList = (p: VpnProfile) => (p.servercert ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
 export const openVpnPage = () => (ui.page = "vpn");
 

@@ -336,15 +336,17 @@ fn finish<R: Runtime>(app: &AppHandle<R>, id: &str, c: &Arc<Conn>) {
             }
         }
     }
-    emit_status(app, c);
     if let Some(st) = app.try_state::<VpnState>() {
-        // A retry may already have replaced this entry with a newer connection.
         st.last_logs.lock().unwrap().insert(id.to_string(), c.log.lock().unwrap().iter().cloned().collect());
+        // A retry may already have replaced this entry with a newer connection.
         let mut conns = st.conns.lock().unwrap();
         if conns.get(id).map(|x| Arc::ptr_eq(x, c)).unwrap_or(false) {
             conns.remove(id);
         }
     }
+    // Announce only after the entry is gone (and the lock released), so listeners never
+    // see a finished connection in the list.
+    emit_status(app, c);
 }
 
 #[tauri::command]
@@ -787,18 +789,26 @@ fn tunnel_windows<R: Runtime>(a: &AppHandle<R>, id: &str, c: &Arc<Conn>, p: &Arc
         if matches!(connected, Ok(Ok(()))) {
             let _ = server.write_all(format!("{cookie}\n").as_bytes()).await;
             let _ = server.flush().await;
-            let _ = server.disconnect();
+            // Do NOT DisconnectNamedPipe here: it discards data the client hasn't read yet
+            // (that lost the cookie in 0.1.4). Wait until the client closes its end.
+            use tokio::io::AsyncReadExt;
+            let mut b = [0u8; 1];
+            let _ = tokio::time::timeout(Duration::from_secs(60), server.read(&mut b)).await;
         }
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "named pipe oluşturulamadı".to_string())??;
 
     // Tunnel arguments: protocol + script from the profile, the rest from --authenticate.
     let winarg = |a: &str| if a.contains([' ', '"']) { format!("\"{}\"", a.replace('"', "\\\"")) } else { a.to_string() };
-    let mut args: Vec<String> = vec![format!("--interface={iface}"), "--cookie-on-stdin".into()];
+    // --non-inter: the tunnel phase must never wait for input it can't get.
+    let mut args: Vec<String> = vec![format!("--interface={iface}"), "--cookie-on-stdin".into(), "--non-inter".into()];
     args.extend(l.args.iter().filter(|a| a.starts_with("--protocol=") || a.starts_with("--script=")).cloned());
-    if let Some(f) = vars.get("FINGERPRINT").filter(|f| !f.is_empty()) {
-        args.push(format!("--servercert={f}"));
+    // The gateway's certificate seen during --authenticate, plus every pin the user trusted.
+    let mut pins: Vec<String> = l.args.iter().filter_map(|a| a.strip_prefix("--servercert=").map(String::from)).collect();
+    if let Some(f) = vars.get("FINGERPRINT").filter(|f| !f.is_empty() && !pins.contains(f)) {
+        pins.push(f.clone());
     }
+    args.extend(pins.into_iter().map(|p| format!("--servercert={p}")));
     if let Some(r) = vars.get("RESOLVE").filter(|r| !r.is_empty()) {
         args.push(format!("--resolve={r}"));
     }
@@ -815,6 +825,10 @@ $pipe.Connect(60000)
 $reader = New-Object System.IO.StreamReader($pipe)
 $cookie = $reader.ReadLine()
 $reader.Dispose()
+if ([string]::IsNullOrEmpty($cookie)) {{
+  Add-Content -Path '{err}' -Value 'TP-ERROR: oturum anahtari (cookie) yonetici surecine ulasmadi'
+  exit 1
+}}
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = '{prog}'
 $psi.Arguments = '{args}'
@@ -1266,6 +1280,44 @@ echo 'Configured as 10.9.9.9, with SSL connected'\ntrap 'exit 0' INT TERM\nwhile
         assert!(vpn_list(h.state()).await.unwrap().is_empty());
         let log = vpn_log(h.state(), "pn".into()).await.unwrap();
         assert!(log.iter().any(|l| l.contains("İç hata: boom")), "{log:?}");
+    }
+
+    /// Several trusted pins (portal + gateway); an unknown certificate with pins set must
+    /// come back as a "cert" error carrying the server's real pin.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn multiple_pins_and_unmatched_pin() {
+        let spec = std::env::var("TP_TEST_VPN").expect("TP_TEST_VPN");
+        let p: Vec<&str> = spec.split('|').collect();
+        let app = tauri::test::mock_app();
+        app.manage(VpnState::default());
+        let h = app.handle().clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Status>();
+        h.listen("vpn-status", move |e| { let _ = tx.send(serde_json::from_str(e.payload()).unwrap()); });
+        let mk = |id: &str, pins: String| serde_json::from_value::<ConnectReq>(serde_json::json!({
+            "id": id, "name": "t", "protocol": "openconnect", "ocProtocol": "anyconnect",
+            "server": p[0], "user": p[1], "password": p[2], "servercert": pins, "mode": "app"
+        })).unwrap();
+        // Wrong pin + real pin → connects.
+        vpn_connect(h.clone(), h.state(), mk("mp1", format!("pin-sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=,{}", p[3]))).await.unwrap();
+        loop {
+            let s = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("timeout").unwrap();
+            assert_ne!(s.state, "error", "{:?}", s.error);
+            if s.state == "connected" { break; }
+        }
+        vpn_disconnect(h.state(), "mp1".into()).await.unwrap();
+        loop {
+            let s = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await.expect("timeout").unwrap();
+            if s.id == "mp1" && s.state == "disconnected" { break; }
+        }
+        // Only a wrong pin → cert error with the server's actual pin.
+        vpn_connect(h.clone(), h.state(), mk("mp2", "pin-sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into())).await.unwrap();
+        let s = loop {
+            let s = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("timeout").unwrap();
+            if s.id == "mp2" && s.state == "error" { break s; }
+        };
+        assert_eq!(s.error_kind.as_deref(), Some("cert"), "{:?}", s.error);
+        assert_eq!(s.pin.as_deref(), Some(p[3]));
     }
 
     #[test]

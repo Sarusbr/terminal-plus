@@ -6,6 +6,11 @@ use super::{components, Action, ConnectReq, Launch, Parser};
 
 const PROTOCOLS: [&str; 6] = ["gp", "anyconnect", "fortinet", "pulse", "f5", "array"];
 
+/// Trusted pins of a profile ("a,b,c" → [a, b, c]).
+pub fn pins(req: &ConnectReq) -> Vec<String> {
+    req.servercert.as_deref().unwrap_or("").split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+}
+
 pub fn launch<R: Runtime>(app: &AppHandle<R>, req: &ConnectReq, socks_port: Option<u16>) -> Result<Launch, String> {
     let program = components::find(app, "openconnect", "openconnect").ok_or("COMPONENT_MISSING: openconnect")?;
     let proto = req.oc_protocol.as_deref().filter(|p| PROTOCOLS.contains(p)).unwrap_or("anyconnect");
@@ -19,7 +24,9 @@ pub fn launch<R: Runtime>(app: &AppHandle<R>, req: &ConnectReq, socks_port: Opti
     if let Some(c) = req.cert_path.as_deref().filter(|c| !c.is_empty()) {
         args.push(format!("--certificate={c}"));
     }
-    if let Some(pin) = req.servercert.as_deref().filter(|p| !p.is_empty()) {
+    // Every certificate the user trusted for this profile (GlobalProtect portal and
+    // gateway may differ); openconnect accepts --servercert several times.
+    for pin in pins(req) {
         args.push(format!("--servercert={pin}"));
     }
     match socks_port {
@@ -129,6 +136,11 @@ impl Parser for OcParser {
             let tx = parts.next().and_then(bytes_in).unwrap_or(0);
             return vec![Action::Stats { rx, tx }];
         }
+        // A certificate not in the trusted list: "… match server's certificate: pin-sha256:…"
+        if low.starts_with("none of the") && low.contains("--servercert") {
+            let pin = l.rsplit(": ").next().map(|p| p.trim().to_string()).filter(|p| p.contains(':'));
+            return vec![Action::Fail { kind: "cert", message: "Sunucu sertifikası güvenilenler listesinde değil".into(), pin }];
+        }
         if let Some(i) = l.find("--servercert ") {
             self.pin = Some(l[i + 13..].trim().to_string());
             return vec![];
@@ -158,6 +170,12 @@ impl Parser for OcParser {
         }
         if low.contains("saml") && (low.contains("not supported") || low.contains("external browser") || low.contains("prelogin")) && low.contains("saml") {
             self.last_info = l.to_string();
+        }
+        if let Some(m) = l.strip_prefix("TP-ERROR: ") {
+            return vec![Action::Fail { kind: "other", message: m.to_string(), pin: None }];
+        }
+        if low.contains("cookie was rejected") || low.contains("invalid authentication cookie") {
+            return vec![Action::Fail { kind: "auth", message: "Oturum anahtarı sunucu tarafından reddedildi; tekrar bağlan".into(), pin: None }];
         }
         if low.contains("tun device") && (low.contains("fail") || low.contains("cannot") || low.contains("permission") || low.contains("not permitted")) {
             return vec![Action::Fail { kind: "denied", message: "TUN aygıtı açılamadı (yönetici izni gerekli)".into(), pin: None }];
@@ -257,6 +275,10 @@ mod tests {
         assert!(matches!(&p.line("RX: 10 packets (564 B); TX: 6 packets (248 B)")[..], [Action::Stats { rx: 564, tx: 248 }]));
         p.line("    --servercert pin-sha256:abc=");
         assert!(matches!(&p.prompt("Enter 'yes' to accept, 'no' to abort; anything else to view:")[..], [Action::Send(_), Action::Fail { kind: "cert", pin: Some(_), .. }]));
+        assert!(matches!(&p.line("None of the 1 fingerprint(s) specified via --servercert match server's certificate: pin-sha256:NEW=")[..],
+            [Action::Fail { kind: "cert", pin: Some(x), .. }] if x == "pin-sha256:NEW="));
+        let multi: ConnectReq = serde_json::from_value(serde_json::json!({"id":"m","name":"m","protocol":"openconnect","server":"s","mode":"app","servercert":"pin-sha256:A=, pin-sha256:B="})).unwrap();
+        assert_eq!(pins(&multi), vec!["pin-sha256:A=", "pin-sha256:B="]);
         p.line("Login failed.");
         assert!(matches!(&p.line("Failed to complete authentication")[..], [Action::Fail { kind: "auth", .. }]));
         assert!(matches!(&p.prompt("Please enter your password.")[..], []));

@@ -8,7 +8,7 @@ import { confirm, toast } from "../../stores/ui";
 import { fmtBytes } from "../../stores/transfers";
 import {
   vpn, OC_PROTOCOLS, appModeSupported, newProfile, saveProfile, removeProfile, connect, disconnect,
-  installComponent, refreshComponent, fmtDuration, type VpnProfile, type VpnMode,
+  installComponent, refreshComponent, fmtDuration, pinList, type VpnProfile, type VpnMode,
 } from "../../stores/vpn";
 
 const editing = ref<VpnProfile | null>(null);
@@ -38,6 +38,10 @@ async function save() {
   p.name = p.name.trim() || p.server;
   await saveProfile(p, password.value ? password.value : undefined);
   editing.value = null;
+}
+function removePin(pin: string) {
+  if (!editing.value) return;
+  editing.value.servercert = pinList(editing.value).filter((x) => x !== pin).join(",") || undefined;
 }
 async function forgetPassword() {
   if (!editing.value) return;
@@ -152,8 +156,8 @@ onBeforeUnmount(() => clearInterval(tick));
           </select>
         </label>
       </div>
-      <div v-if="editing.servercert" class="pin muted"><Icon name="shield" :size="12" /> Sabitlenmiş sertifika: <code>{{ editing.servercert }}</code>
-        <button type="button" class="link" @click="editing.servercert = undefined">kaldır</button></div>
+      <div v-for="pin in pinList(editing)" :key="pin" class="pin muted"><Icon name="shield" :size="12" /> Güvenilen sertifika: <code>{{ pin }}</code>
+        <button type="button" class="link" @click="removePin(pin)">kaldır</button></div>
       <div class="actions">
         <button type="button" class="btn" @click="editing = null">Vazgeç</button>
         <button type="submit" class="btn primary"><Icon name="check" :size="14" /> Kaydet</button>
@@ -229,7 +233,7 @@ onBeforeUnmount(() => clearInterval(tick));
             <button class="ib" :data-tip="revealed === null ? 'Göster' : 'Gizle'" @click="reveal(p)"><Icon :name="revealed === null ? 'eye' : 'eyeOff'" :size="13" /></button>
           </b></div>
           <div v-if="p.certPath"><span>Sertifika</span><b>{{ p.certPath }}</b></div>
-          <div v-if="p.servercert"><span>Sunucu pin</span><b>{{ p.servercert }}</b></div>
+          <div v-if="p.servercert"><span>Sertifikalar</span><b><div v-for="pin in pinList(p)" :key="pin">{{ pin }}</div></b></div>
           <div><span>Varsayılan mod</span><b>{{ modeName(p.defaultMode) }}</b></div>
         </div>
       </div>
