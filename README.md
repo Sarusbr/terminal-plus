@@ -9,7 +9,6 @@ server: panels type standard commands (`ls`, `docker`, `ps`, …) into your own 
 | Platform | Dosya |
 | --- | --- |
 | macOS — Apple Silicon (M1/M2/M3/M4) | [TerminalPlus-macos-apple-silicon.dmg](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-macos-apple-silicon.dmg) |
-| macOS — Intel | [TerminalPlus-macos-intel.dmg](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-macos-intel.dmg) |
 | Windows (kurulum) | [TerminalPlus-windows-x64-setup.exe](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-windows-x64-setup.exe) |
 | Windows (MSI) | [TerminalPlus-windows-x64.msi](https://github.com/Sarusbr/terminal-plus/releases/latest/download/TerminalPlus-windows-x64.msi) |
 

@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 → builds macOS (Apple Silicon + Intel) and Windows,
+# Push a tag like v0.1.0 → builds macOS (Apple Silicon) and Windows,
 # uploads installers with stable file names to the GitHub Release for that tag.
 on:
   push:
@@ -39,10 +39,6 @@ jobs:
             target: aarch64-apple-darwin
             bundles: dmg
             label: macos-apple-silicon
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            bundles: dmg
-            label: macos-intel
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis,msi
